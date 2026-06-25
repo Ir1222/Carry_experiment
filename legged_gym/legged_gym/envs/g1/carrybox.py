@@ -79,8 +79,18 @@ class LeggedRobot(BaseTask):
         self.num_one_step_actor_obs = self.cfg.env.num_proprio_obs + self.cfg.env.num_task_obs
         self.actor_history_length = self.cfg.env.num_actor_history
         self.actor_obs_length = self.cfg.env.num_actor_obs
+        self.num_base_lin_vel_priv = self.cfg.env.num_base_lin_vel_priv
+        self.num_interaction_priv_obs = self.cfg.env.num_interaction_priv_obs
         
         self.num_privileged_obs = self.cfg.env.num_privileged_obs
+        assert self.num_one_step_proprio_obs == 108, self.num_one_step_proprio_obs
+        assert self.num_task_obs == 15, self.num_task_obs
+        assert self.actor_history_length == 6, self.actor_history_length
+        assert self.num_one_step_actor_obs == 123, self.num_one_step_actor_obs
+        assert self.actor_obs_length == 738, self.actor_obs_length
+        assert self.num_base_lin_vel_priv == 3, self.num_base_lin_vel_priv
+        assert self.num_interaction_priv_obs == 17, self.num_interaction_priv_obs
+        assert self.num_privileged_obs == 758, self.num_privileged_obs
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -335,6 +345,10 @@ class LeggedRobot(BaseTask):
         self._reset_env_tensors(env_ids)
 
         # reset buffers
+        self.obs_buf[env_ids] = 0.
+        if self.privileged_obs_buf is not None:
+            self.privileged_obs_buf[env_ids] = 0.
+        self._just_reset_env_ids = env_ids.clone()
         self.last_actions[env_ids] = 0.
         self.last_last_actions[env_ids] = 0.
         self.last_dof_vel[env_ids] = 0.
@@ -477,10 +491,7 @@ class LeggedRobot(BaseTask):
     
         return task_obs_actor, task_obs_critic
 
-    def compute_observations(self):
-        """ Computes observations
-        """
-        # proprioceptive observations
+    def _compute_actor_step_and_task_obs(self):
         current_actor_obs = torch.cat((self.base_ang_vel  * self.obs_scales.ang_vel,
                                  self.projected_gravity,
                                  (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
@@ -488,44 +499,122 @@ class LeggedRobot(BaseTask):
                                  self.end_effector_pos,
                                  self.actions
                                  ), dim=-1)
-        
-        current_obs = torch.cat((self.base_ang_vel  * self.obs_scales.ang_vel,
-                                 self.projected_gravity,
-                                 (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                 self.dof_vel * self.obs_scales.dof_vel,
-                                 self.end_effector_pos,
-                                 self.actions,
-                                 self.base_lin_vel * self.obs_scales.lin_vel,
-                                 ), dim=-1)
 
         # add noise if needed
         if self.add_noise:
             current_actor_obs = current_actor_obs + (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec
         
-        # task observations
         task_obs_actor, task_obs_critic = self.compute_task_observations()
-        
-        # actor & critic observations
-        self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_actor_obs:], current_actor_obs, task_obs_actor), dim=-1)
-        self.privileged_obs_buf = torch.cat((current_obs, task_obs_critic), dim=-1)
-        
+        return current_actor_obs, task_obs_actor, task_obs_critic
+
+    def _build_actor_history_obs(self, current_actor_proprio, task_obs_actor, commit: bool):
+        actor_history_obs = torch.cat((self.obs_buf[:, self.num_one_step_actor_obs:],
+                                       current_actor_proprio,
+                                       task_obs_actor), dim=-1)
+        if commit:
+            self.obs_buf = actor_history_obs
+        return actor_history_obs
+
+    def _compute_interaction_privileged_proxy(self, log_stats=False):
+        if not self.cfg.interaction_priv.enabled:
+            return torch.zeros(self.num_envs, self.num_interaction_priv_obs, device=self.device, dtype=torch.float)
+
+        base_quat = self.rigid_body_states[:, self.upper_body_index, 3:7]
+        box_lin_vel_local = quat_rotate_inverse(base_quat, self.box_states[:, 7:10])
+        box_ang_vel_local = quat_rotate_inverse(base_quat, self.box_states[:, 10:13])
+
+        left_hand_force_world = self.contact_forces[:, self.left_hand_net_contact_force_index, :]
+        right_hand_force_world = self.contact_forces[:, self.right_hand_net_contact_force_index, :]
+        box_force_world = self.contact_forces[:, self.box_net_contact_force_index, :]
+
+        left_hand_force_local = quat_rotate_inverse(base_quat, left_hand_force_world)
+        right_hand_force_local = quat_rotate_inverse(base_quat, right_hand_force_world)
+        box_force_local = quat_rotate_inverse(base_quat, box_force_world)
+
+        left_force_norm = torch.linalg.vector_norm(left_hand_force_world, dim=-1, keepdim=True)
+        right_force_norm = torch.linalg.vector_norm(right_hand_force_world, dim=-1, keepdim=True)
+        box_force_norm = torch.linalg.vector_norm(box_force_world, dim=-1, keepdim=True)
+        left_contact_flag = (left_force_norm > self.cfg.interaction_priv.hand_contact_force_threshold).float()
+        right_contact_flag = (right_force_norm > self.cfg.interaction_priv.hand_contact_force_threshold).float()
+
+        scaled_box_lin_vel_local = box_lin_vel_local * self.cfg.interaction_priv.box_lin_vel_scale
+        scaled_box_ang_vel_local = box_ang_vel_local * self.cfg.interaction_priv.box_ang_vel_scale
+        scaled_left_hand_force_local = left_hand_force_local * self.cfg.interaction_priv.net_contact_force_scale
+        scaled_right_hand_force_local = right_hand_force_local * self.cfg.interaction_priv.net_contact_force_scale
+        scaled_box_force_local = box_force_local * self.cfg.interaction_priv.net_contact_force_scale
+
+        interaction_priv_proxy = torch.cat((scaled_box_lin_vel_local,
+                                            scaled_box_ang_vel_local,
+                                            scaled_left_hand_force_local,
+                                            scaled_right_hand_force_local,
+                                            scaled_box_force_local,
+                                            left_contact_flag,
+                                            right_contact_flag), dim=-1)
+        interaction_priv_proxy = torch.clamp(interaction_priv_proxy,
+                                             -self.cfg.interaction_priv.clip_value,
+                                             self.cfg.interaction_priv.clip_value)
+
+        if log_stats:
+            scaled_left_norm = torch.linalg.vector_norm(scaled_left_hand_force_local, dim=-1, keepdim=True)
+            scaled_right_norm = torch.linalg.vector_norm(scaled_right_hand_force_local, dim=-1, keepdim=True)
+            scaled_box_norm = torch.linalg.vector_norm(scaled_box_force_local, dim=-1, keepdim=True)
+            print(
+                "[CarryBox interaction_priv] "
+                f"raw_left_net_force_norm mean={left_force_norm.mean().item():.4f} max={left_force_norm.max().item():.4f}; "
+                f"raw_right_net_force_norm mean={right_force_norm.mean().item():.4f} max={right_force_norm.max().item():.4f}; "
+                f"raw_box_net_force_norm mean={box_force_norm.mean().item():.4f} max={box_force_norm.max().item():.4f}; "
+                f"scaled_left_net_force_norm mean={scaled_left_norm.mean().item():.4f} max={scaled_left_norm.max().item():.4f}; "
+                f"scaled_right_net_force_norm mean={scaled_right_norm.mean().item():.4f} max={scaled_right_norm.max().item():.4f}; "
+                f"scaled_box_net_force_norm mean={scaled_box_norm.mean().item():.4f} max={scaled_box_norm.max().item():.4f}; "
+                f"left_contact_rate={left_contact_flag.mean().item():.4f}; "
+                f"right_contact_rate={right_contact_flag.mean().item():.4f}"
+            )
+
+        return interaction_priv_proxy
+
+    def _build_critic_obs(self, actor_history_obs, interaction_priv_proxy):
+        base_lin_vel_priv = self.base_lin_vel * self.obs_scales.lin_vel
+        critic_obs = torch.cat((actor_history_obs, base_lin_vel_priv, interaction_priv_proxy), dim=-1)
+        return critic_obs
+
+    def _should_log_interaction_priv(self):
+        interval = self.cfg.interaction_priv.debug_log_interval
+        return interval > 0 and self.common_step_counter % interval == 0
+
+    def _assert_observation_shapes(self, actor_history_obs, critic_obs, interaction_priv_proxy):
+        assert actor_history_obs.shape == (self.num_envs, self.actor_obs_length), actor_history_obs.shape
+        assert interaction_priv_proxy.shape == (self.num_envs, self.num_interaction_priv_obs), interaction_priv_proxy.shape
+        assert critic_obs.shape == (self.num_envs, self.num_privileged_obs), critic_obs.shape
+
+    def compute_observations(self):
+        """ Computes observations
+        """
+        current_actor_obs, task_obs_actor, _ = self._compute_actor_step_and_task_obs()
+        actor_history_obs = self._build_actor_history_obs(current_actor_obs, task_obs_actor, commit=True)
+        log_stats = self._should_log_interaction_priv()
+        interaction_priv_proxy = self._compute_interaction_privileged_proxy(log_stats=log_stats)
+
+        if self._just_reset_env_ids.numel() > 0:
+            interaction_priv_proxy[self._just_reset_env_ids] = 0.0
+
+        self.privileged_obs_buf = self._build_critic_obs(actor_history_obs, interaction_priv_proxy)
+        self._assert_observation_shapes(self.obs_buf, self.privileged_obs_buf, interaction_priv_proxy)
+
+        if log_stats:
+            invalid_count = torch.sum(~torch.isfinite(self.privileged_obs_buf)).item()
+            print(f"[CarryBox interaction_priv] critic_obs_nan_inf_count={invalid_count}")
+
+        self._just_reset_env_ids = torch.empty(0, dtype=torch.long, device=self.device)
+
     def compute_termination_observations(self, env_ids):
         """ Computes observations
         """
-        # proprioceptive observations
-        current_obs = torch.cat((self.base_ang_vel  * self.obs_scales.ang_vel,
-                                 self.projected_gravity,
-                                 (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                 self.dof_vel * self.obs_scales.dof_vel,
-                                 self.end_effector_pos,
-                                 self.actions,
-                                 self.base_lin_vel * self.obs_scales.lin_vel
-                                 ),dim=-1)
-        
-        # task observations  
-        _, task_obs_critic = self.compute_task_observations()
-        
-        return torch.cat((current_obs, task_obs_critic), dim=-1)[env_ids]
+        current_actor_obs, task_obs_actor, _ = self._compute_actor_step_and_task_obs()
+        actor_history_obs = self._build_actor_history_obs(current_actor_obs, task_obs_actor, commit=False)
+        interaction_priv_proxy = self._compute_interaction_privileged_proxy(log_stats=False)
+        termination_critic_obs = self._build_critic_obs(actor_history_obs, interaction_priv_proxy)
+        self._assert_observation_shapes(actor_history_obs, termination_critic_obs, interaction_priv_proxy)
+        return termination_critic_obs[env_ids]
         
     def create_sim(self):
         """ Creates simulation, terrain and evironments
@@ -1087,6 +1176,26 @@ class LeggedRobot(BaseTask):
         self.right_feet_pos = self.rigid_body_states[:, self.right_feet_indices, 0:3]
 
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, 3 + self.num_bodies, 3) # shape: num_envs, num_bodies, xyz axis
+        self._just_reset_env_ids = torch.empty(0, dtype=torch.long, device=self.device)
+        assert self.rigid_body_states.shape == (self.num_envs, 3 + self.num_bodies, 13), self.rigid_body_states.shape
+        assert self.contact_forces.shape == (self.num_envs, 3 + self.num_bodies, 3), self.contact_forces.shape
+        assert self.box_states.shape == (self.num_envs, 13), self.box_states.shape
+        assert int(self.left_hand_net_contact_force_index) < self.contact_forces.shape[1]
+        assert int(self.right_hand_net_contact_force_index) < self.contact_forces.shape[1]
+        assert int(self.box_net_contact_force_index) < self.contact_forces.shape[1]
+        print(
+            "[CarryBox interaction_priv startup] "
+            f"rigid_body_states_shape={tuple(self.rigid_body_states.shape)}, "
+            f"contact_forces_shape={tuple(self.contact_forces.shape)}, "
+            f"box_states_shape={tuple(self.box_states.shape)}, "
+            f"left_hand_net_contact_force_index={int(self.left_hand_net_contact_force_index)} "
+            f"name={self.left_hand_net_contact_force_name}, "
+            f"right_hand_net_contact_force_index={int(self.right_hand_net_contact_force_index)} "
+            f"name={self.right_hand_net_contact_force_name}, "
+            f"box_net_contact_force_index={int(self.box_net_contact_force_index)} "
+            f"name={self.box_net_contact_force_name}, "
+            f"box_actor_body_count={self.box_actor_body_count}"
+        )
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -1475,6 +1584,12 @@ class LeggedRobot(BaseTask):
             
         hand_pos_names = [s for s in body_names if self.cfg.asset.hand_pos_name in s]
         hand_colli_names = [s for s in body_names if self.cfg.asset.hand_colli_name in s]
+        left_hand_pos_names = [s for s in hand_pos_names if "left_" in s]
+        right_hand_pos_names = [s for s in hand_pos_names if "right_" in s]
+        assert len(left_hand_pos_names) == 1, left_hand_pos_names
+        assert len(right_hand_pos_names) == 1, right_hand_pos_names
+        self.left_hand_net_contact_force_name = left_hand_pos_names[0]
+        self.right_hand_net_contact_force_name = right_hand_pos_names[0]
 
         self.torso_link_index = body_names.index("torso_link")
 
@@ -1561,6 +1676,8 @@ class LeggedRobot(BaseTask):
         self.hand_pos_indices = torch.zeros(len(hand_pos_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(hand_pos_names)):
             self.hand_pos_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], hand_pos_names[i])
+        self.left_hand_net_contact_force_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.left_hand_net_contact_force_name)
+        self.right_hand_net_contact_force_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.right_hand_net_contact_force_name)
         
         self.hand_colli_indices = torch.zeros(len(hand_colli_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(hand_colli_names)):
@@ -1631,6 +1748,11 @@ class LeggedRobot(BaseTask):
         self.keyframe_indices = torch.zeros(len(self.keyframe_names), dtype=torch.long, device=self.device)
         for i, name in enumerate(self.keyframe_names):
             self.keyframe_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], name)
+
+        self.box_actor_body_count = len(self.gym.get_actor_rigid_body_properties(self.envs[0], self.box_handles[0]))
+        assert self.box_actor_body_count == 1, self.box_actor_body_count
+        self.box_net_contact_force_index = self.gym.get_actor_rigid_body_handle(self.envs[0], self.box_handles[0], 0)
+        self.box_net_contact_force_name = "box"
 
 
     def _get_env_origins(self):

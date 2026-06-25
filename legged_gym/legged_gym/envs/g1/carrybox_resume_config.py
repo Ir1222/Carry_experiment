@@ -10,8 +10,11 @@ class G1Cfg(LeggedRobotCfg):
         num_proprio_obs = 6 + num_dofs * 2 + num_actions + 3 * 5
         num_task_obs = 15
         num_actor_history = 6
-        num_actor_obs = num_actor_history * (num_proprio_obs + num_task_obs)
-        num_privileged_obs = num_proprio_obs + 3 + num_task_obs
+        num_one_step_actor_obs = num_proprio_obs + num_task_obs
+        num_actor_obs = num_actor_history * num_one_step_actor_obs
+        num_base_lin_vel_priv = 3
+        num_interaction_priv_obs = 17
+        num_privileged_obs = num_actor_obs + num_base_lin_vel_priv + num_interaction_priv_obs
 
         env_spacing = 10. # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
@@ -19,6 +22,17 @@ class G1Cfg(LeggedRobotCfg):
 
         action_curriculum = False
         test = False
+
+    class interaction_priv:
+        enabled = True
+        hand_contact_force_threshold = 1.0
+
+        box_lin_vel_scale = 1.0
+        box_ang_vel_scale = 1.0
+        net_contact_force_scale = 1.0
+
+        clip_value = 10.0
+        debug_log_interval = 500
 
     class init_state(LeggedRobotCfg.init_state):
         pos = [2.3, 0.0, 0.8] # x,y,z [m]

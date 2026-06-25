@@ -304,7 +304,16 @@ class HIMOnPolicyRunner:
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=self.device)
-        self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        try:
+            self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        except RuntimeError as err:
+            raise RuntimeError(
+                "Checkpoint model shape is incompatible with the current actor/critic. "
+                f"The current critic observation dimension is {self.num_critic_obs}; "
+                "Phase A changes CarryBox critic input to the 758-D actor-history-conditioned "
+                "privileged critic, so old full checkpoints must not be loaded silently. "
+                "Start fresh training or implement an explicit actor-only/AMP-only warm start."
+            ) from err
         if 'amp_state_dict' in loaded_dict.keys():
             self.alg.amp.load_state_dict(loaded_dict['amp_state_dict'])
         if self.cfg["use_muon_optim"]:
