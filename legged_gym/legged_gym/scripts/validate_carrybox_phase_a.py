@@ -69,13 +69,24 @@ def validate(num_envs, smoke_iterations, rollout_steps, rl_device):
     _disable_amp_reward_and_loss(runner)
 
     zero_actions = torch.zeros(num_envs, env.num_actions, device=env.device)
-    obs, critic_obs, _, _, _, _, _, _ = env.step(zero_actions)
+    obs, critic_obs, _, _, infos, _, _, _ = env.step(zero_actions)
     obs = env.get_observations()
     critic_obs = env.get_privileged_observations()
     assert list(obs.shape) == [num_envs, 738], obs.shape
     assert list(critic_obs.shape) == [num_envs, 758], critic_obs.shape
     assert torch.isfinite(obs).all()
     assert torch.isfinite(critic_obs).all()
+
+    privileged_info = infos["privileged"]
+    privileged_tail = critic_obs[:, 738:758]
+    for index, name in enumerate(env._PRIVILEGED_TAIL_LOG_NAMES):
+        logged_mean = privileged_info[f"channels/{name}_mean"]
+        assert torch.allclose(logged_mean, privileged_tail[:, index].mean()), name
+    for key in ("contact/left_rate", "contact/right_rate", "contact/both_rate", "contact/either_rate"):
+        assert 0.0 <= privileged_info[key].item() <= 1.0, (key, privileged_info[key])
+    assert privileged_info["contact/left_flag_mismatch_rate"].item() == 0.0
+    assert privileged_info["contact/right_flag_mismatch_rate"].item() == 0.0
+    assert privileged_info["critic/finite_fraction"].item() == 1.0
 
     interaction_proxy = env._compute_interaction_privileged_proxy(log_stats=False)
     assert list(interaction_proxy.shape) == [num_envs, 17], interaction_proxy.shape
@@ -110,6 +121,8 @@ def validate(num_envs, smoke_iterations, rollout_steps, rl_device):
     print(f"termination_critic_obs_shape={tuple(termination_critic_obs.shape)}")
     print(f"actor_first_layer_in_features={actor_first.in_features}")
     print(f"critic_first_layer_in_features={critic_first.in_features}")
+    print("privileged_tensorboard_info_validated=True")
+    print("contact_flag_mismatch_rates=0.0,0.0")
     print(f"smoke_iterations={smoke_iterations}")
     print(f"rollout_steps_per_env={rollout_steps}")
     print("amp_reward_and_loss_disabled_for_validation=True")

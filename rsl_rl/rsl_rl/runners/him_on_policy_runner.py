@@ -137,6 +137,8 @@ class HIMOnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
+            privileged_info_sums = {}
+            privileged_info_counts = {}
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -163,6 +165,13 @@ class HIMOnPolicyRunner:
                         # Book keeping
                         if 'episode' in infos:
                             ep_infos.append(infos['episode'])
+                        if 'privileged' in infos:
+                            for key, value in infos['privileged'].items():
+                                if not isinstance(value, torch.Tensor):
+                                    value = torch.as_tensor(value, dtype=torch.float, device=self.device)
+                                value = value.detach().to(self.device, dtype=torch.float).mean()
+                                privileged_info_sums[key] = privileged_info_sums.get(key, 0.0) + value
+                                privileged_info_counts[key] = privileged_info_counts.get(key, 0) + 1
                         cur_reward_sum += rewards
                         cur_raw_reward_sum += raw_rewards
                         cur_amp_reward_sum += amp_reward
@@ -241,6 +250,12 @@ class HIMOnPolicyRunner:
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
         # self.writer.add_scalar('Perf/motionbuffer_size', locs['currentlength'], locs['it'])
+        for key, value_sum in locs['privileged_info_sums'].items():
+            count = locs['privileged_info_counts'][key]
+            self.writer.add_scalar('Privileged/' + key, value_sum / count, locs['it'])
+        if locs['privileged_info_counts']:
+            logged_steps = max(locs['privileged_info_counts'].values())
+            self.writer.add_scalar('Privileged/rollout_logged_steps', logged_steps, locs['it'])
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_raw_reward', statistics.mean(locs['raw_rewbuffer']), locs['it'])

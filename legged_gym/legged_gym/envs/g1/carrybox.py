@@ -51,6 +51,29 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from legged_gym.envs.motionlib.motionlib_carrybox import MotionLib
 
 class LeggedRobot(BaseTask):
+    _PRIVILEGED_TAIL_LOG_NAMES = (
+        "base_lin_vel_local_x",
+        "base_lin_vel_local_y",
+        "base_lin_vel_local_z",
+        "box_lin_vel_local_x",
+        "box_lin_vel_local_y",
+        "box_lin_vel_local_z",
+        "box_ang_vel_local_x",
+        "box_ang_vel_local_y",
+        "box_ang_vel_local_z",
+        "left_hand_net_contact_force_local_x",
+        "left_hand_net_contact_force_local_y",
+        "left_hand_net_contact_force_local_z",
+        "right_hand_net_contact_force_local_x",
+        "right_hand_net_contact_force_local_y",
+        "right_hand_net_contact_force_local_z",
+        "box_net_contact_force_local_x",
+        "box_net_contact_force_local_y",
+        "box_net_contact_force_local_z",
+        "left_hand_contact_flag",
+        "right_hand_contact_flag",
+    )
+
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
         """ Parses the provided config file,
             calls create_sim() (which creates, simulation, terrain and environments),
@@ -577,6 +600,55 @@ class LeggedRobot(BaseTask):
         critic_obs = torch.cat((actor_history_obs, base_lin_vel_priv, interaction_priv_proxy), dim=-1)
         return critic_obs
 
+    def _build_privileged_log_info(self, interaction_priv_proxy):
+        privileged_tail = self.privileged_obs_buf[:, self.actor_obs_length:]
+        assert privileged_tail.shape == (self.num_envs, len(self._PRIVILEGED_TAIL_LOG_NAMES)), privileged_tail.shape
+
+        channel_means = privileged_tail.mean(dim=0)
+        info = {
+            f"channels/{name}_mean": channel_means[index].detach()
+            for index, name in enumerate(self._PRIVILEGED_TAIL_LOG_NAMES)
+        }
+
+        vector_slices = {
+            "base_lin_vel_local": privileged_tail[:, 0:3],
+            "box_lin_vel_local": interaction_priv_proxy[:, 0:3],
+            "box_ang_vel_local": interaction_priv_proxy[:, 3:6],
+            "left_hand_net_contact_force_local": interaction_priv_proxy[:, 6:9],
+            "right_hand_net_contact_force_local": interaction_priv_proxy[:, 9:12],
+            "box_net_contact_force_local": interaction_priv_proxy[:, 12:15],
+        }
+        for name, vector in vector_slices.items():
+            info[f"norms/{name}_mean"] = torch.linalg.vector_norm(vector, dim=-1).mean().detach()
+
+        left_contact_flag = interaction_priv_proxy[:, 15]
+        right_contact_flag = interaction_priv_proxy[:, 16]
+        expected_left_flag = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.left_hand_net_contact_force_index, :], dim=-1
+            ) > self.cfg.interaction_priv.hand_contact_force_threshold
+        ).float()
+        expected_right_flag = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.right_hand_net_contact_force_index, :], dim=-1
+            ) > self.cfg.interaction_priv.hand_contact_force_threshold
+        ).float()
+        if self._just_reset_env_ids.numel() > 0:
+            expected_left_flag[self._just_reset_env_ids] = 0.0
+            expected_right_flag[self._just_reset_env_ids] = 0.0
+
+        info.update({
+            "contact/left_rate": left_contact_flag.mean().detach(),
+            "contact/right_rate": right_contact_flag.mean().detach(),
+            "contact/both_rate": (left_contact_flag * right_contact_flag).mean().detach(),
+            "contact/either_rate": torch.maximum(left_contact_flag, right_contact_flag).mean().detach(),
+            "contact/left_flag_mismatch_rate": (left_contact_flag != expected_left_flag).float().mean().detach(),
+            "contact/right_flag_mismatch_rate": (right_contact_flag != expected_right_flag).float().mean().detach(),
+            "critic/finite_fraction": torch.isfinite(self.privileged_obs_buf).float().mean().detach(),
+            "reset/fraction": (self.reset_buf > 0).float().mean().detach(),
+        })
+        return info
+
     def _should_log_interaction_priv(self):
         interval = self.cfg.interaction_priv.debug_log_interval
         return interval > 0 and self.common_step_counter % interval == 0
@@ -599,9 +671,14 @@ class LeggedRobot(BaseTask):
 
         self.privileged_obs_buf = self._build_critic_obs(actor_history_obs, interaction_priv_proxy)
         self._assert_observation_shapes(self.obs_buf, self.privileged_obs_buf, interaction_priv_proxy)
+        self.extras["privileged"] = self._build_privileged_log_info(interaction_priv_proxy)
 
         if log_stats:
             invalid_count = torch.sum(~torch.isfinite(self.privileged_obs_buf)).item()
+            left_flag_mismatch_rate = self.extras["privileged"]["contact/left_flag_mismatch_rate"].item()
+            right_flag_mismatch_rate = self.extras["privileged"]["contact/right_flag_mismatch_rate"].item()
+            assert left_flag_mismatch_rate == 0.0, left_flag_mismatch_rate
+            assert right_flag_mismatch_rate == 0.0, right_flag_mismatch_rate
             print(f"[CarryBox interaction_priv] critic_obs_nan_inf_count={invalid_count}")
 
         self._just_reset_env_ids = torch.empty(0, dtype=torch.long, device=self.device)

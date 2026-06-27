@@ -187,6 +187,26 @@ python legged_gym/scripts/play.py --task [task_name] --resume_path [ckpt_path]
 > 
 > If you prefer to use **Weights & Biases (wandb)**, please enable it in the corresponding `[task_name]_config.py` file and set the appropriate `wandb_entity` for your account.
 
+For Phase A CarryBox training, TensorBoard also records the added critic-tail
+channels under `Privileged/channels`, vector magnitudes under
+`Privileged/norms`, and hand-contact diagnostics under `Privileged/contact`.
+The contact flag mismatch rates should remain exactly zero, and
+`Privileged/rollout_logged_steps` should equal the configured rollout length
+(`100` by default).
+
+From the PhysHSI repository root, start TensorBoard with:
+
+```bash
+tensorboard --logdir legged_gym/logs/amp_carrybox --port 6006 --host 127.0.0.1
+```
+
+Then open `http://127.0.0.1:6006`. For a remote Ubuntu server, forward the port
+from the local computer before opening the same URL:
+
+```bash
+ssh -L 6006:127.0.0.1:6006 USER@SERVER_IP
+```
+
 ## 👏 Acknowledgements
 
 This repository is built upon the support and contributions of the following open-source projects. Special thanks to:
