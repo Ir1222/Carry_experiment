@@ -103,23 +103,72 @@ python legged_gym/scripts/play.py --task carrybox --resume_path resources/ckpt/c
 
 ### CarryBox
 
-CarryBox is a challenging long-horizon task. We train it in two steps:
+CarryBox is a challenging long-horizon task. The current `carrybox` and
+`carrybox_resume` configurations automatically use the Phase A observations:
+the actor input remains 738-D, while the critic input is the 738-D actor
+history plus 3-D local base linear velocity and the 17-D privileged
+interaction proxy (758-D total). No additional command-line flag is required.
 
-1. **Initial training:** Use a relatively small AMP coefficient and relaxed termination conditions for easier learning. Run approximately 20k steps:
+Run the following Ubuntu commands from the PhysHSI repository root.
+
+1. **Initial Phase A training (20,000 iterations):**
+
     ```bash
-    python legged_gym/scripts/train.py --task carrybox --headless 
+    conda activate physhsi
+    cd /absolute/path/to/PhysHSI
+    python legged_gym/legged_gym/scripts/train.py \
+        --task carrybox \
+        --headless \
+        --rl_device cuda:0 \
+        --run_name phase_a_stage1 \
+        --max_iterations 20000
     ```
 
-2. **Refined training**: To better align with the data, manually increase the AMP coefficient and continue training for about 30~40k steps:
-    ```bash
-    python legged_gym/scripts/train.py --task carrybox_resume --resume --resume_path [ckpt_path] --headless
-    ```
-    Here, `[ckpt_path]` refers to the checkpoint from the first 20k-step training stage.
+    TensorBoard logs and checkpoints are written under
+    `legged_gym/logs/amp_carrybox/<timestamp>_phase_a_stage1/`. The final
+    checkpoint is normally named `model_19999.pt` because checkpoint filenames
+    use a zero-based learning-iteration index.
 
-To play the final trained checkpoint:
-```bash
-python legged_gym/scripts/play.py --task carrybox --resume_path [ckpt_path]
-```
+2. **Refined Phase A training (30,000 additional iterations):**
+
+    Replace `<timestamp>` below with the timestamp in the stage-1 run directory.
+    The resume checkpoint must have been trained with the Phase A 758-D critic;
+    an original pre-Phase-A CarryBox checkpoint is shape-incompatible.
+
+    ```bash
+    STAGE1_CKPT="$PWD/legged_gym/logs/amp_carrybox/<timestamp>_phase_a_stage1/model_19999.pt"
+    test -f "$STAGE1_CKPT"
+
+    python legged_gym/legged_gym/scripts/train.py \
+        --task carrybox_resume \
+        --resume \
+        --resume_path "$STAGE1_CKPT" \
+        --headless \
+        --rl_device cuda:0 \
+        --run_name phase_a_stage2 \
+        --max_iterations 30000
+    ```
+
+    Since stage 2 resumes at iteration 20,000, its final checkpoint is normally
+    `legged_gym/logs/amp_carrybox/<timestamp>_phase_a_stage2/model_49999.pt`.
+
+3. **Visual validation with `play.py`:**
+
+    Replace `<timestamp>` with the stage-2 run timestamp. Do not pass
+    `--headless`; `play.py` opens the Isaac Gym viewer. The critic and privileged
+    observations are used during training only; playback executes the unchanged
+    actor from the Phase A checkpoint.
+
+    ```bash
+    FINAL_CKPT="$PWD/legged_gym/logs/amp_carrybox/<timestamp>_phase_a_stage2/model_49999.pt"
+    test -f "$FINAL_CKPT"
+
+    python legged_gym/legged_gym/scripts/play.py \
+        --task carrybox \
+        --resume_path "$FINAL_CKPT" \
+        --rl_device cuda:0 \
+        --num_envs 1
+    ```
 
 ### Other Tasks
 
