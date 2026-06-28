@@ -288,6 +288,8 @@ class LeggedRobot(BaseTask):
 
         self._can_see_tag()
 
+        self._update_carry_phase()
+
         self.check_termination()
 
         self.compute_reward()
@@ -411,7 +413,83 @@ class LeggedRobot(BaseTask):
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
         if self.cfg.env.action_curriculum:
             self.extras["episode"]["action_curriculum_ratio"] = self.action_curriculum_ratio
+
+        episode_lengths = torch.clamp(self.episode_length_buf[env_ids], min=1).float()
+        self.extras["episode"]["carry_phase_ratio"] = torch.mean(
+            self.carry_phase_episode_sum[env_ids] / episode_lengths
+        )
+        self.extras["episode"]["confirmed_carry_ratio"] = torch.mean(
+            self.confirmed_carry_episode_sum[env_ids] / episode_lengths
+        )
+        self.extras["episode"]["box_clearance_mean"] = torch.mean(
+            self.box_clearance_episode_sum[env_ids] / episode_lengths
+        )
+        self.extras["episode"]["both_hand_contact_ratio"] = torch.mean(
+            self.both_hand_contact_episode_sum[env_ids] / episode_lengths
+        )
+        self.carry_phase_episode_sum[env_ids] = 0.0
+        self.confirmed_carry_episode_sum[env_ids] = 0.0
+        self.box_clearance_episode_sum[env_ids] = 0.0
+        self.both_hand_contact_episode_sum[env_ids] = 0.0
         self.episode_length_buf[env_ids] = 0
+
+    def _update_carry_phase(self):
+        """Update the minimal geometric/static carry masks and episode metrics."""
+        carry_phase_cfg = getattr(self.cfg, "carry_phase", None)
+        support_height = torch.full_like(
+            self.box_states[:, 2],
+            float(getattr(carry_phase_cfg, "support_height", 0.0)),
+        )
+        platform_top_height = self.platform_pos[:, 2] + 0.5 * self._platform_height
+        support_height = torch.maximum(support_height, platform_top_height)
+
+        self.box_clearance_buf[:] = (
+            self.box_states[:, 2] - 0.5 * self._box_size[:, 2] - support_height
+        )
+        height_mask = self.box_clearance_buf > float(
+            getattr(carry_phase_cfg, "clearance_on", 0.05)
+        )
+
+        if bool(getattr(carry_phase_cfg, "use_static_check", True)):
+            box_rel_lin_vel = self.box_states[:, 7:10] - self.root_states[:, 7:10]
+            static_mask = (
+                torch.linalg.vector_norm(box_rel_lin_vel, dim=-1)
+                < float(getattr(carry_phase_cfg, "max_box_rel_lin_vel", 1.0))
+            ) & (
+                torch.linalg.vector_norm(self.box_states[:, 10:13], dim=-1)
+                < float(getattr(carry_phase_cfg, "max_box_ang_vel", 3.0))
+            )
+        else:
+            static_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+
+        contact_force_threshold = float(
+            getattr(carry_phase_cfg, "contact_force_threshold", 1.0)
+        )
+        left_contact = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.left_hand_net_contact_force_index, :], dim=-1
+            )
+            > contact_force_threshold
+        )
+        right_contact = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.right_hand_net_contact_force_index, :], dim=-1
+            )
+            > contact_force_threshold
+        )
+        both_contact = left_contact & right_contact
+        self.both_hand_contact_buf[:] = both_contact.float()
+
+        if bool(getattr(carry_phase_cfg, "enable", True)):
+            self.carry_phase_buf[:] = height_mask & static_mask
+        else:
+            self.carry_phase_buf.zero_()
+        self.confirmed_carry_buf[:] = self.carry_phase_buf & both_contact
+
+        self.carry_phase_episode_sum += self.carry_phase_buf.float()
+        self.confirmed_carry_episode_sum += self.confirmed_carry_buf.float()
+        self.box_clearance_episode_sum += self.box_clearance_buf
+        self.both_hand_contact_episode_sum += self.both_hand_contact_buf
 
     def update_command_curriculum(self, env_ids):
         """ Implements a curriculum of increasing commands
@@ -1297,6 +1375,23 @@ class LeggedRobot(BaseTask):
             f"name={self.box_net_contact_force_name}, "
             f"box_actor_body_count={self.box_actor_body_count}"
         )
+
+        self.carry_phase_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
+        )
+        self.confirmed_carry_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
+        )
+        self.box_clearance_buf = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+        )
+        self.both_hand_contact_buf = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+        )
+        self.carry_phase_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        self.confirmed_carry_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        self.box_clearance_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        self.both_hand_contact_episode_sum = torch.zeros_like(self.box_clearance_buf)
 
         # initialize some data used later on
         self.common_step_counter = 0

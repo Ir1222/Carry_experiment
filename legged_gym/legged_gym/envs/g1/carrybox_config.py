@@ -42,6 +42,17 @@ class G1Cfg(LeggedRobotCfg):
         clip_value = 10.0
         debug_log_interval = 500
 
+    class carry_phase:
+        enable = True
+        clearance_on = 0.05
+        # Fallback ground height. The detector uses the source platform top
+        # whenever it is higher than this value.
+        support_height = 0.0
+        use_static_check = True
+        max_box_rel_lin_vel = 1.0
+        max_box_ang_vel = 3.0
+        contact_force_threshold = 1.0
+
     class init_state(LeggedRobotCfg.init_state):
         pos = [2.3, 0.0, 0.8] # x,y,z [m]
         rot = [0.0, 0.0, 1.0, 0.0] # x,y,z,w [quat]
