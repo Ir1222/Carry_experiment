@@ -103,6 +103,7 @@ class LeggedRobot(BaseTask):
         self.actor_history_length = self.cfg.env.num_actor_history
         self.actor_obs_length = self.cfg.env.num_actor_obs
         self.num_base_lin_vel_priv = self.cfg.env.num_base_lin_vel_priv
+        self.num_current_frame_critic_obs = self.cfg.env.num_current_frame_critic_obs
         self.num_interaction_priv_obs = self.cfg.env.num_interaction_priv_obs
         
         self.num_privileged_obs = self.cfg.env.num_privileged_obs
@@ -112,8 +113,9 @@ class LeggedRobot(BaseTask):
         assert self.num_one_step_actor_obs == 123, self.num_one_step_actor_obs
         assert self.actor_obs_length == 738, self.actor_obs_length
         assert self.num_base_lin_vel_priv == 3, self.num_base_lin_vel_priv
+        assert self.num_current_frame_critic_obs == 126, self.num_current_frame_critic_obs
         assert self.num_interaction_priv_obs == 17, self.num_interaction_priv_obs
-        assert self.num_privileged_obs == 758, self.num_privileged_obs
+        assert self.num_privileged_obs == 143, self.num_privileged_obs
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -595,23 +597,44 @@ class LeggedRobot(BaseTask):
 
         return interaction_priv_proxy
 
-    def _build_critic_obs(self, actor_history_obs, interaction_priv_proxy):
-        base_lin_vel_priv = self.base_lin_vel * self.obs_scales.lin_vel
-        critic_obs = torch.cat((actor_history_obs, base_lin_vel_priv, interaction_priv_proxy), dim=-1)
+    def _build_current_frame_critic_base(self, task_obs_critic):
+        critic_base = torch.cat((self.base_ang_vel * self.obs_scales.ang_vel,
+                                 self.projected_gravity,
+                                 (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+                                 self.dof_vel * self.obs_scales.dof_vel,
+                                 self.end_effector_pos,
+                                 self.actions,
+                                 self.base_lin_vel * self.obs_scales.lin_vel,
+                                 task_obs_critic), dim=-1)
+        assert critic_base.shape == (self.num_envs, self.num_current_frame_critic_obs), critic_base.shape
+        return critic_base
+
+    def _build_critic_obs(self, task_obs_critic, interaction_priv_proxy):
+        critic_base = self._build_current_frame_critic_base(task_obs_critic)
+        critic_obs = torch.cat((critic_base, interaction_priv_proxy), dim=-1)
+        assert critic_obs.shape == (self.num_envs, self.num_privileged_obs), critic_obs.shape
         return critic_obs
 
     def _build_privileged_log_info(self, interaction_priv_proxy):
-        privileged_tail = self.privileged_obs_buf[:, self.actor_obs_length:]
-        assert privileged_tail.shape == (self.num_envs, len(self._PRIVILEGED_TAIL_LOG_NAMES)), privileged_tail.shape
+        base_lin_vel_start = self.num_one_step_proprio_obs
+        base_lin_vel_end = base_lin_vel_start + self.num_base_lin_vel_priv
+        base_lin_vel_priv = self.privileged_obs_buf[:, base_lin_vel_start:base_lin_vel_end]
+        critic_interaction_priv = self.privileged_obs_buf[:, self.num_current_frame_critic_obs:]
+        assert critic_interaction_priv.shape == interaction_priv_proxy.shape, critic_interaction_priv.shape
+        assert torch.equal(critic_interaction_priv, interaction_priv_proxy)
+        privileged_log_values = torch.cat((base_lin_vel_priv, critic_interaction_priv), dim=-1)
+        assert privileged_log_values.shape == (
+            self.num_envs, len(self._PRIVILEGED_TAIL_LOG_NAMES)
+        ), privileged_log_values.shape
 
-        channel_means = privileged_tail.mean(dim=0)
+        channel_means = privileged_log_values.mean(dim=0)
         info = {
             f"channels/{name}_mean": channel_means[index].detach()
             for index, name in enumerate(self._PRIVILEGED_TAIL_LOG_NAMES)
         }
 
         vector_slices = {
-            "base_lin_vel_local": privileged_tail[:, 0:3],
+            "base_lin_vel_local": base_lin_vel_priv,
             "box_lin_vel_local": interaction_priv_proxy[:, 0:3],
             "box_ang_vel_local": interaction_priv_proxy[:, 3:6],
             "left_hand_net_contact_force_local": interaction_priv_proxy[:, 6:9],
@@ -661,7 +684,7 @@ class LeggedRobot(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
-        current_actor_obs, task_obs_actor, _ = self._compute_actor_step_and_task_obs()
+        current_actor_obs, task_obs_actor, task_obs_critic = self._compute_actor_step_and_task_obs()
         actor_history_obs = self._build_actor_history_obs(current_actor_obs, task_obs_actor, commit=True)
         log_stats = self._should_log_interaction_priv()
         interaction_priv_proxy = self._compute_interaction_privileged_proxy(log_stats=log_stats)
@@ -669,7 +692,7 @@ class LeggedRobot(BaseTask):
         if self._just_reset_env_ids.numel() > 0:
             interaction_priv_proxy[self._just_reset_env_ids] = 0.0
 
-        self.privileged_obs_buf = self._build_critic_obs(actor_history_obs, interaction_priv_proxy)
+        self.privileged_obs_buf = self._build_critic_obs(task_obs_critic, interaction_priv_proxy)
         self._assert_observation_shapes(self.obs_buf, self.privileged_obs_buf, interaction_priv_proxy)
         self.extras["privileged"] = self._build_privileged_log_info(interaction_priv_proxy)
 
@@ -686,12 +709,13 @@ class LeggedRobot(BaseTask):
     def compute_termination_observations(self, env_ids):
         """ Computes observations
         """
-        current_actor_obs, task_obs_actor, _ = self._compute_actor_step_and_task_obs()
-        actor_history_obs = self._build_actor_history_obs(current_actor_obs, task_obs_actor, commit=False)
+        _, task_obs_critic = self.compute_task_observations()
         interaction_priv_proxy = self._compute_interaction_privileged_proxy(log_stats=False)
-        termination_critic_obs = self._build_critic_obs(actor_history_obs, interaction_priv_proxy)
-        self._assert_observation_shapes(actor_history_obs, termination_critic_obs, interaction_priv_proxy)
-        return termination_critic_obs[env_ids]
+        termination_critic_obs = self._build_critic_obs(task_obs_critic, interaction_priv_proxy)
+        termination_critic_obs = termination_critic_obs[env_ids]
+        assert termination_critic_obs.shape == (env_ids.numel(), self.num_privileged_obs), termination_critic_obs.shape
+        assert torch.isfinite(termination_critic_obs).all(), "Non-finite terminal critic observations"
+        return termination_critic_obs
         
     def create_sim(self):
         """ Creates simulation, terrain and evironments

@@ -104,10 +104,9 @@ python legged_gym/scripts/play.py --task carrybox --resume_path resources/ckpt/c
 ### CarryBox
 
 CarryBox is a challenging long-horizon task. The current `carrybox` and
-`carrybox_resume` configurations automatically use the Phase A observations:
-the actor input remains 738-D, while the critic input is the 738-D actor
-history plus 3-D local base linear velocity and the 17-D privileged
-interaction proxy (758-D total). No additional command-line flag is required.
+`carrybox_resume` configurations use a 738-D actor history and a compact 143-D
+critic: the original PhysHSI 126-D current-frame critic plus the existing 17-D
+privileged interaction proxy. No additional command-line flag is required.
 
 Run the following Ubuntu commands from the PhysHSI repository root.
 
@@ -132,8 +131,10 @@ Run the following Ubuntu commands from the PhysHSI repository root.
 2. **Refined Phase A training (30,000 additional iterations):**
 
     Replace `<timestamp>` below with the timestamp in the stage-1 run directory.
-    The resume checkpoint must have been trained with the Phase A 758-D critic;
-    an original pre-Phase-A CarryBox checkpoint is shape-incompatible.
+    The resume checkpoint must have been trained with the current 143-D critic.
+    Old 758-D actor-history-conditioned critic checkpoints are intentionally
+    shape-incompatible and must only be used from the
+    `backup/critic-history-758d` branch or the `critic-history-758d-v1` tag.
 
     ```bash
     STAGE1_CKPT="$PWD/legged_gym/logs/amp_carrybox/<timestamp>_phase_a_stage1/model_19999.pt"

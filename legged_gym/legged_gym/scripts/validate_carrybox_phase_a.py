@@ -73,15 +73,20 @@ def validate(num_envs, smoke_iterations, rollout_steps, rl_device):
     obs = env.get_observations()
     critic_obs = env.get_privileged_observations()
     assert list(obs.shape) == [num_envs, 738], obs.shape
-    assert list(critic_obs.shape) == [num_envs, 758], critic_obs.shape
+    assert list(critic_obs.shape) == [num_envs, 143], critic_obs.shape
     assert torch.isfinite(obs).all()
     assert torch.isfinite(critic_obs).all()
 
+    _, task_obs_critic = env.compute_task_observations()
+    critic_base = env._build_current_frame_critic_base(task_obs_critic)
+    assert list(critic_base.shape) == [num_envs, 126], critic_base.shape
+    assert torch.allclose(critic_obs[:, 0:126], critic_base)
+
     privileged_info = infos["privileged"]
-    privileged_tail = critic_obs[:, 738:758]
+    privileged_log_values = torch.cat((critic_obs[:, 108:111], critic_obs[:, 126:143]), dim=-1)
     for index, name in enumerate(env._PRIVILEGED_TAIL_LOG_NAMES):
         logged_mean = privileged_info[f"channels/{name}_mean"]
-        assert torch.allclose(logged_mean, privileged_tail[:, index].mean()), name
+        assert torch.allclose(logged_mean, privileged_log_values[:, index].mean()), name
     for key in ("contact/left_rate", "contact/right_rate", "contact/both_rate", "contact/either_rate"):
         assert 0.0 <= privileged_info[key].item() <= 1.0, (key, privileged_info[key])
     assert privileged_info["contact/left_flag_mismatch_rate"].item() == 0.0
@@ -90,19 +95,19 @@ def validate(num_envs, smoke_iterations, rollout_steps, rl_device):
 
     interaction_proxy = env._compute_interaction_privileged_proxy(log_stats=False)
     assert list(interaction_proxy.shape) == [num_envs, 17], interaction_proxy.shape
-    assert torch.allclose(critic_obs[:, 741:758], interaction_proxy)
+    assert torch.allclose(critic_obs[:, 126:143], interaction_proxy)
 
     obs_before_terminal = obs.clone()
     term_ids = torch.arange(min(4, num_envs), device=env.device)
     termination_critic_obs = env.compute_termination_observations(term_ids)
-    assert termination_critic_obs.shape[-1] == 758, termination_critic_obs.shape
+    assert list(termination_critic_obs.shape) == [term_ids.numel(), 143], termination_critic_obs.shape
     assert torch.isfinite(termination_critic_obs).all()
     assert torch.equal(env.obs_buf, obs_before_terminal)
 
     actor_first = runner.alg.actor_critic.actor[0]
     critic_first = runner.alg.actor_critic.critic[0]
     assert actor_first.in_features == 738, actor_first.in_features
-    assert critic_first.in_features == 758, critic_first.in_features
+    assert critic_first.in_features == 143, critic_first.in_features
     with torch.inference_mode():
         actions = runner.alg.actor_critic.act_inference(obs.to(runner.device))
     assert list(actions.shape) == [num_envs, env.num_actions], actions.shape
@@ -111,12 +116,14 @@ def validate(num_envs, smoke_iterations, rollout_steps, rl_device):
     obs = env.get_observations()
     critic_obs = env.get_privileged_observations()
     assert list(obs.shape) == [num_envs, 738], obs.shape
-    assert list(critic_obs.shape) == [num_envs, 758], critic_obs.shape
+    assert list(critic_obs.shape) == [num_envs, 143], critic_obs.shape
     assert torch.isfinite(obs).all()
     assert torch.isfinite(critic_obs).all()
 
     print("carrybox_phase_a_validation_passed")
     print(f"actor_obs_shape={tuple(obs.shape)}")
+    print(f"critic_base_shape={tuple(critic_base.shape)}")
+    print(f"interaction_priv_shape={tuple(interaction_proxy.shape)}")
     print(f"critic_obs_shape={tuple(critic_obs.shape)}")
     print(f"termination_critic_obs_shape={tuple(termination_critic_obs.shape)}")
     print(f"actor_first_layer_in_features={actor_first.in_features}")

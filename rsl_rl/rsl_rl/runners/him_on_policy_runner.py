@@ -326,9 +326,10 @@ class HIMOnPolicyRunner:
             raise RuntimeError(
                 "Checkpoint model shape is incompatible with the current actor/critic. "
                 f"The current critic observation dimension is {self.num_critic_obs}; "
-                "Phase A changes CarryBox critic input to the 758-D actor-history-conditioned "
-                "privileged critic, so old full checkpoints must not be loaded silently. "
-                "Start fresh training or implement an explicit actor-only/AMP-only warm start."
+                "old 758-D actor-history-conditioned CarryBox critic checkpoints are not "
+                "compatible with the current 143-D critic. Start fresh training. Use old "
+                "758-D checkpoints only from backup/critic-history-758d or tag "
+                "critic-history-758d-v1."
             ) from err
         if 'amp_state_dict' in loaded_dict.keys():
             self.alg.amp.load_state_dict(loaded_dict['amp_state_dict'])

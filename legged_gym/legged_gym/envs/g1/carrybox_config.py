@@ -14,7 +14,15 @@ class G1Cfg(LeggedRobotCfg):
         num_actor_obs = num_actor_history * num_one_step_actor_obs
         num_base_lin_vel_priv = 3
         num_interaction_priv_obs = 17
-        num_privileged_obs = num_actor_obs + num_base_lin_vel_priv + num_interaction_priv_obs
+        num_current_frame_critic_obs = (
+            num_proprio_obs
+            + num_base_lin_vel_priv
+            + num_task_obs
+        )  # 126
+        num_privileged_obs = (
+            num_current_frame_critic_obs
+            + num_interaction_priv_obs
+        )  # 143
 
         env_spacing = 10. # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
