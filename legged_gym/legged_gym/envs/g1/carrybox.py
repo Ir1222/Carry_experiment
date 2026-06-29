@@ -554,8 +554,14 @@ class LeggedRobot(BaseTask):
         lifted = self.box_clearance_buf > float(self.cfg.carry_phase.clearance_on)
 
         box_lin_vel = self.box_states[:, 7:10]
-        left_hand_lin_vel = self.rigid_body_states[:, self.hand_pos_indices[0], 7:10]
-        right_hand_lin_vel = self.rigid_body_states[:, self.hand_pos_indices[1], 7:10]
+        # Use the collision-hand bodies for contact-relative motion. Palm links
+        # remain dedicated position markers for actor observations.
+        left_hand_lin_vel = self.rigid_body_states[
+            :, self.left_hand_net_contact_force_index, 7:10
+        ]
+        right_hand_lin_vel = self.rigid_body_states[
+            :, self.right_hand_net_contact_force_index, 7:10
+        ]
         left_rel_speed = torch.linalg.vector_norm(
             left_hand_lin_vel - box_lin_vel, dim=-1
         )
@@ -1868,14 +1874,22 @@ class LeggedRobot(BaseTask):
         hand_colli_names = [s for s in body_names if self.cfg.asset.hand_colli_name in s]
         left_hand_pos_names = [s for s in hand_pos_names if "left_" in s]
         right_hand_pos_names = [s for s in hand_pos_names if "right_" in s]
+        left_hand_colli_names = [s for s in hand_colli_names if "left_" in s]
+        right_hand_colli_names = [s for s in hand_colli_names if "right_" in s]
         assert len(left_hand_pos_names) == 1, left_hand_pos_names
         assert len(right_hand_pos_names) == 1, right_hand_pos_names
-        self.left_hand_net_contact_force_name = left_hand_pos_names[0]
-        self.right_hand_net_contact_force_name = right_hand_pos_names[0]
+        assert len(left_hand_colli_names) == 1, left_hand_colli_names
+        assert len(right_hand_colli_names) == 1, right_hand_colli_names
         assert hand_pos_names == [
+            left_hand_pos_names[0],
+            right_hand_pos_names[0],
+        ], f"Expected left/right palm ordering, got {hand_pos_names}"
+        self.left_hand_net_contact_force_name = left_hand_colli_names[0]
+        self.right_hand_net_contact_force_name = right_hand_colli_names[0]
+        assert hand_colli_names == [
             self.left_hand_net_contact_force_name,
             self.right_hand_net_contact_force_name,
-        ], f"Expected left/right palm ordering, got {hand_pos_names}"
+        ], f"Expected left/right collision-hand ordering, got {hand_colli_names}"
 
         self.torso_link_index = body_names.index("torso_link")
 
@@ -1964,12 +1978,12 @@ class LeggedRobot(BaseTask):
             self.hand_pos_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], hand_pos_names[i])
         self.left_hand_net_contact_force_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.left_hand_net_contact_force_name)
         self.right_hand_net_contact_force_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.right_hand_net_contact_force_name)
-        assert int(self.hand_pos_indices[0]) == int(self.left_hand_net_contact_force_index)
-        assert int(self.hand_pos_indices[1]) == int(self.right_hand_net_contact_force_index)
         
         self.hand_colli_indices = torch.zeros(len(hand_colli_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(hand_colli_names)):
             self.hand_colli_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], hand_colli_names[i])
+        assert int(self.hand_colli_indices[0]) == int(self.left_hand_net_contact_force_index)
+        assert int(self.hand_colli_indices[1]) == int(self.right_hand_net_contact_force_index)
 
         self.head_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.cfg.asset.head_name)
 
