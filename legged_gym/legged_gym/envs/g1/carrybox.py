@@ -2381,19 +2381,25 @@ class LeggedRobot(BaseTask):
         return carry_height_reward
 
     def _reward_bimanual_contact(self):
-        lifted, left_contact, right_contact, _, _ = (
+        _, left_contact, right_contact, _, _ = (
             self._get_hand_box_interaction_state()
         )
-        return lifted.float() * (left_contact & right_contact).float()
+        return (
+            self.carry_phase_buf.float()
+            * (left_contact & right_contact).float()
+        )
 
     def _reward_single_hand_contact(self):
-        lifted, left_contact, right_contact, _, _ = (
+        _, left_contact, right_contact, _, _ = (
             self._get_hand_box_interaction_state()
         )
-        return lifted.float() * torch.logical_xor(left_contact, right_contact).float()
+        return (
+            self.carry_phase_buf.float()
+            * torch.logical_xor(left_contact, right_contact).float()
+        )
 
     def _reward_hand_box_relative_motion(self):
-        lifted, left_contact, right_contact, left_rel_speed, right_rel_speed = (
+        _, left_contact, right_contact, left_rel_speed, right_rel_speed = (
             self._get_hand_box_interaction_state()
         )
         deadband = float(self.cfg.rewards.hand_box_rel_vel_deadband)
@@ -2406,7 +2412,7 @@ class LeggedRobot(BaseTask):
         ).square()
 
         contact_count = left_contact.float() + right_contact.float()
-        active = lifted & (contact_count > 0.0)
+        active = self.carry_phase_buf & (contact_count > 0.0)
         contacted_hand_penalty = (
             left_contact.float() * left_penalty
             + right_contact.float() * right_penalty
