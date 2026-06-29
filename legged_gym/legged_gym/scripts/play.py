@@ -19,6 +19,62 @@ from collections import defaultdict
 from multiprocessing import Process, Value
 
 
+def load_actor_only_for_inference(ppo_runner, checkpoint_path, device):
+    """Load a compatible actor while ignoring a training-only critic mismatch."""
+    if checkpoint_path is None:
+        raise ValueError("CarryBox play requires --resume_path to load the inference actor.")
+
+    checkpoint_path = os.path.expanduser(
+        checkpoint_path.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+    )
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"CarryBox checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint_state = checkpoint["model_state_dict"]
+    actor_state = {
+        key: value
+        for key, value in checkpoint_state.items()
+        if key == "std" or key.startswith("actor.")
+    }
+    current_state = ppo_runner.alg.actor_critic.state_dict()
+    shape_mismatches = {}
+    for key, value in actor_state.items():
+        if key not in current_state:
+            shape_mismatches[key] = (tuple(value.shape), None)
+        elif value.shape != current_state[key].shape:
+            shape_mismatches[key] = (
+                tuple(value.shape), tuple(current_state[key].shape)
+            )
+    if shape_mismatches:
+        raise RuntimeError(
+            "CarryBox actor is incompatible with the current policy: "
+            f"{shape_mismatches}"
+        )
+
+    incompatible = ppo_runner.alg.actor_critic.load_state_dict(
+        actor_state, strict=False
+    )
+    missing_non_critic = [
+        key for key in incompatible.missing_keys if not key.startswith("critic.")
+    ]
+    if missing_non_critic or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Actor-only checkpoint load was incomplete: "
+            f"missing={missing_non_critic}, unexpected={incompatible.unexpected_keys}"
+        )
+
+    checkpoint_critic_dim = checkpoint_state["critic.0.weight"].shape[1]
+    current_critic_dim = current_state["critic.0.weight"].shape[1]
+    actor_input_dim = checkpoint_state["actor.0.weight"].shape[1]
+    print(
+        f"Loaded CarryBox inference actor from: {checkpoint_path} "
+        f"(actor_input={actor_input_dim}, "
+        f"checkpoint_critic={checkpoint_critic_dim}, "
+        f"current_critic={current_critic_dim}; critic intentionally skipped)"
+    )
+
+
 def print_carry_phase_debug(env, dones, step, env_id=0):
     """Print the CarryBox carry-phase decision and every signal used by it."""
     # Carry phase detection: this block is used to detect and print the current carry phase.
@@ -90,6 +146,9 @@ def play(args):
         env_cfg.asset.box.random_props = False
         env_cfg.asset.box.reset_mode = 'default'
         env_cfg.env.episode_length_s = 10
+        # Play only needs the actor. Load it separately so old 126-D critic
+        # checkpoints can run with the current 143-D carry-phase environment.
+        train_cfg.runner.resume = False
     # sitdown
     if args.task == 'sitdown' or args.task == 'liedown':
         env_cfg.asset.chair.random_size = False
@@ -111,6 +170,10 @@ def play(args):
 
     # load policy
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    if args.task == 'carrybox' and not args.play_dataset:
+        load_actor_only_for_inference(
+            ppo_runner, args.resume_path, device=env.device
+        )
     policy = ppo_runner.get_inference_policy(device=env.device)
     
     # export policy as a jit & onnx module (used to run it from C++)
