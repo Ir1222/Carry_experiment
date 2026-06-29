@@ -427,10 +427,31 @@ class LeggedRobot(BaseTask):
         self.extras["episode"]["both_hand_contact_ratio"] = torch.mean(
             self.both_hand_contact_episode_sum[env_ids] / episode_lengths
         )
+        active_contact_samples = torch.sum(
+            self.hand_box_rel_speed_contact_episode_count[env_ids]
+        )
+        lifted_samples = torch.sum(self.lifted_episode_count[env_ids])
+        self.extras["episode"]["hand_box_rel_speed_contact_mean"] = (
+            torch.sum(self.hand_box_rel_speed_contact_episode_sum[env_ids])
+            / torch.clamp(active_contact_samples, min=1.0)
+        )
+        self.extras["episode"]["hand_box_rel_motion_violation_ratio"] = (
+            torch.sum(self.hand_box_rel_motion_violation_episode_sum[env_ids])
+            / torch.clamp(active_contact_samples, min=1.0)
+        )
+        self.extras["episode"]["lifted_bimanual_contact_ratio"] = (
+            torch.sum(self.lifted_bimanual_contact_episode_sum[env_ids])
+            / torch.clamp(lifted_samples, min=1.0)
+        )
         self.carry_phase_episode_sum[env_ids] = 0.0
         self.confirmed_carry_episode_sum[env_ids] = 0.0
         self.box_clearance_episode_sum[env_ids] = 0.0
         self.both_hand_contact_episode_sum[env_ids] = 0.0
+        self.hand_box_rel_speed_contact_episode_sum[env_ids] = 0.0
+        self.hand_box_rel_speed_contact_episode_count[env_ids] = 0.0
+        self.hand_box_rel_motion_violation_episode_sum[env_ids] = 0.0
+        self.lifted_bimanual_contact_episode_sum[env_ids] = 0.0
+        self.lifted_episode_count[env_ids] = 0.0
         self.episode_length_buf[env_ids] = 0
 
     def _update_carry_phase(self):
@@ -490,6 +511,58 @@ class LeggedRobot(BaseTask):
         self.confirmed_carry_episode_sum += self.confirmed_carry_buf.float()
         self.box_clearance_episode_sum += self.box_clearance_buf
         self.both_hand_contact_episode_sum += self.both_hand_contact_buf
+
+        lifted, left_contact, right_contact, left_rel_speed, right_rel_speed = (
+            self._get_hand_box_interaction_state()
+        )
+        contact_count = left_contact.float() + right_contact.float()
+        active = lifted & (contact_count > 0.0)
+        contact_rel_speed = (
+            left_contact.float() * left_rel_speed
+            + right_contact.float() * right_rel_speed
+        ) / torch.clamp(contact_count, min=1.0)
+        deadband = float(self.cfg.rewards.hand_box_rel_vel_deadband)
+        rel_motion_violation = active & (
+            (left_contact & (left_rel_speed > deadband))
+            | (right_contact & (right_rel_speed > deadband))
+        )
+        self.hand_box_rel_speed_contact_episode_sum += torch.where(
+            active, contact_rel_speed, torch.zeros_like(contact_rel_speed)
+        )
+        self.hand_box_rel_speed_contact_episode_count += active.float()
+        self.hand_box_rel_motion_violation_episode_sum += rel_motion_violation.float()
+        self.lifted_bimanual_contact_episode_sum += (
+            lifted & left_contact & right_contact
+        ).float()
+        self.lifted_episode_count += lifted.float()
+
+    def _get_hand_box_interaction_state(self):
+        """Return lifted/contact masks and world-frame hand-box relative speeds."""
+        contact_force_threshold = float(self.cfg.carry_phase.contact_force_threshold)
+        left_contact = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.left_hand_net_contact_force_index, :], dim=-1
+            )
+            > contact_force_threshold
+        )
+        right_contact = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.right_hand_net_contact_force_index, :], dim=-1
+            )
+            > contact_force_threshold
+        )
+        lifted = self.box_clearance_buf > float(self.cfg.carry_phase.clearance_on)
+
+        box_lin_vel = self.box_states[:, 7:10]
+        left_hand_lin_vel = self.rigid_body_states[:, self.hand_pos_indices[0], 7:10]
+        right_hand_lin_vel = self.rigid_body_states[:, self.hand_pos_indices[1], 7:10]
+        left_rel_speed = torch.linalg.vector_norm(
+            left_hand_lin_vel - box_lin_vel, dim=-1
+        )
+        right_rel_speed = torch.linalg.vector_norm(
+            right_hand_lin_vel - box_lin_vel, dim=-1
+        )
+        return lifted, left_contact, right_contact, left_rel_speed, right_rel_speed
 
     def update_command_curriculum(self, env_ids):
         """ Implements a curriculum of increasing commands
@@ -1392,6 +1465,19 @@ class LeggedRobot(BaseTask):
         self.confirmed_carry_episode_sum = torch.zeros_like(self.box_clearance_buf)
         self.box_clearance_episode_sum = torch.zeros_like(self.box_clearance_buf)
         self.both_hand_contact_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        self.hand_box_rel_speed_contact_episode_sum = torch.zeros_like(
+            self.box_clearance_buf
+        )
+        self.hand_box_rel_speed_contact_episode_count = torch.zeros_like(
+            self.box_clearance_buf
+        )
+        self.hand_box_rel_motion_violation_episode_sum = torch.zeros_like(
+            self.box_clearance_buf
+        )
+        self.lifted_bimanual_contact_episode_sum = torch.zeros_like(
+            self.box_clearance_buf
+        )
+        self.lifted_episode_count = torch.zeros_like(self.box_clearance_buf)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -1786,6 +1872,10 @@ class LeggedRobot(BaseTask):
         assert len(right_hand_pos_names) == 1, right_hand_pos_names
         self.left_hand_net_contact_force_name = left_hand_pos_names[0]
         self.right_hand_net_contact_force_name = right_hand_pos_names[0]
+        assert hand_pos_names == [
+            self.left_hand_net_contact_force_name,
+            self.right_hand_net_contact_force_name,
+        ], f"Expected left/right palm ordering, got {hand_pos_names}"
 
         self.torso_link_index = body_names.index("torso_link")
 
@@ -1874,6 +1964,8 @@ class LeggedRobot(BaseTask):
             self.hand_pos_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], hand_pos_names[i])
         self.left_hand_net_contact_force_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.left_hand_net_contact_force_name)
         self.right_hand_net_contact_force_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.right_hand_net_contact_force_name)
+        assert int(self.hand_pos_indices[0]) == int(self.left_hand_net_contact_force_index)
+        assert int(self.hand_pos_indices[1]) == int(self.right_hand_net_contact_force_index)
         
         self.hand_colli_indices = torch.zeros(len(hand_colli_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(hand_colli_names)):
@@ -2273,7 +2365,42 @@ class LeggedRobot(BaseTask):
         carry_height_reward = torch.clamp(box_height - box_init_height, min=0, max=target_delta_height) / target_delta_height
         carry_height_reward[self.robot2object_dist > self.cfg.rewards.thresh_robot2object] = 0.
         return carry_height_reward
-    
+
+    def _reward_bimanual_contact(self):
+        lifted, left_contact, right_contact, _, _ = (
+            self._get_hand_box_interaction_state()
+        )
+        return lifted.float() * (left_contact & right_contact).float()
+
+    def _reward_single_hand_contact(self):
+        lifted, left_contact, right_contact, _, _ = (
+            self._get_hand_box_interaction_state()
+        )
+        return lifted.float() * torch.logical_xor(left_contact, right_contact).float()
+
+    def _reward_hand_box_relative_motion(self):
+        lifted, left_contact, right_contact, left_rel_speed, right_rel_speed = (
+            self._get_hand_box_interaction_state()
+        )
+        deadband = float(self.cfg.rewards.hand_box_rel_vel_deadband)
+        bad_speed = float(self.cfg.rewards.hand_box_rel_vel_bad)
+        left_penalty = torch.clamp(
+            (left_rel_speed - deadband) / (bad_speed - deadband), 0.0, 1.0
+        ).square()
+        right_penalty = torch.clamp(
+            (right_rel_speed - deadband) / (bad_speed - deadband), 0.0, 1.0
+        ).square()
+
+        contact_count = left_contact.float() + right_contact.float()
+        active = lifted & (contact_count > 0.0)
+        contacted_hand_penalty = (
+            left_contact.float() * left_penalty
+            + right_contact.float() * right_penalty
+        ) / torch.clamp(contact_count, min=1.0)
+        return torch.where(
+            active, contacted_hand_penalty, torch.zeros_like(contact_count)
+        )
+
     def _reward_heading(self):
         forward = quat_apply(self.base_quat, self.forward_vec)
         heading = torch.atan2(forward[:, 1], forward[:, 0])

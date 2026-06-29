@@ -284,6 +284,18 @@ class G1Cfg(LeggedRobotCfg):
             relocation_task = 1.0
             standup_task = 0.2
 
+            # contact / interaction shaping
+            bimanual_contact = 0.35
+            single_hand_contact = 0.05
+            hand_box_relative_motion = -0.15
+
+        hand_box_rel_vel_deadband = 0.35  # m/s
+        hand_box_rel_vel_bad = 1.20       # m/s
+        assert 0.0 <= hand_box_rel_vel_deadband < hand_box_rel_vel_bad, (
+            "hand_box_rel_vel_deadband must be non-negative and below "
+            "hand_box_rel_vel_bad"
+        )
+
         # walk
         robot2object_pos = 0.0
         robot2object_vel = 1.0
