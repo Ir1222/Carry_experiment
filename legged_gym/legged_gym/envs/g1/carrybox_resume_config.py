@@ -42,6 +42,17 @@ class G1Cfg(LeggedRobotCfg):
         clip_value = 10.0
         debug_log_interval = 500
 
+    class carry_phase:
+        enable = True
+        clearance_on = 0.05
+        # Fallback ground height. The detector uses the source platform top
+        # whenever it is higher than this value.
+        support_height = 0.0
+        use_static_check = True
+        max_box_rel_lin_vel = 1.0
+        max_box_ang_vel = 3.0
+        contact_force_threshold = 1.0
+
     class init_state(LeggedRobotCfg.init_state):
         pos = [2.3, 0.0, 0.8] # x,y,z [m]
         rot = [0.0, 0.0, 1.0, 0.0] # x,y,z,w [quat]
@@ -272,6 +283,18 @@ class G1Cfg(LeggedRobotCfg):
             carryup_task = 1.0
             relocation_task = 1.0
             standup_task = 0.2
+
+            # contact / interaction shaping
+            bimanual_contact = 0.35
+            single_hand_contact = 0.05
+            hand_box_relative_motion = -0.15
+
+        hand_box_rel_vel_deadband = 0.35  # m/s
+        hand_box_rel_vel_bad = 1.20       # m/s
+        assert 0.0 <= hand_box_rel_vel_deadband < hand_box_rel_vel_bad, (
+            "hand_box_rel_vel_deadband must be non-negative and below "
+            "hand_box_rel_vel_bad"
+        )
 
         # walk
         robot2object_pos = 0.0
