@@ -202,7 +202,9 @@ class G1Cfg(LeggedRobotCfg):
             hybrid_init_prob = 0.8  # prob of random, for hybrid mode
 
             skill = ["loco", "pickUp", "carryWith", "putDown"]
-            skill_init_prob = [0.8, 0.2, 0.2, 0.0]
+            # Long-range carry fine-tuning: bias RSI toward already-acquired carries.
+            # The legacy weights were [0.8, 0.2, 0.2, 0.0].
+            skill_init_prob = [0.15, 0.15, 0.70, 0.0]
 
             box_termination = False
             min_tar_dist = 0.5
@@ -281,13 +283,21 @@ class G1Cfg(LeggedRobotCfg):
             ## task rewards
             walk_task = 1.0
             carryup_task = 1.0
-            relocation_task = 1.0
-            standup_task = 0.2
+            # Legacy relocation/standup rewards are intentionally disabled:
+            # relocation_task rewarded robot motion more than box motion, while
+            # standup_task depended on successful placement/release.
+            # relocation_task = 1.0
+            # standup_task = 0.2
+            carry_progress = 1.0
+            carry_stability = 0.5
+            success_termination = 25.0
 
             # contact / interaction shaping
-            bimanual_contact = 0.35
-            single_hand_contact = 0.05
-            hand_box_relative_motion = -0.15
+            # These legacy terms are folded into carry_stability to prevent
+            # duplicated gradients (single_hand_contact was also positive).
+            # bimanual_contact = 0.35
+            # single_hand_contact = 0.05
+            # hand_box_relative_motion = -0.15
 
         hand_box_rel_vel_deadband = 0.35  # m/s
         hand_box_rel_vel_bad = 1.20       # m/s
@@ -306,19 +316,32 @@ class G1Cfg(LeggedRobotCfg):
         hand_contact = 0.0
         box_height = 2.0
 
-        # relocation
-        relocation_heading = 0.5
-        relocation_heading_vel = 0.0
-        robot2goal_pos = 0.0
-        robot2goal_vel = 1.0
-        object2goal_pos = 1.0
-        put_box = 1.0
+        # Legacy relocation parameters (disabled because the new task does not
+        # place the box and must measure box, rather than robot, progress):
+        # relocation_heading = 0.5
+        # relocation_heading_vel = 0.0
+        # robot2goal_pos = 0.0
+        # robot2goal_vel = 1.0
+        # object2goal_pos = 1.0
+        # put_box = 1.0
 
-        # standup
-        base_height = 0.0
-        head_height = 0.5
-        stand_still = 1.0
-        hand_free = 0.5
+        # Legacy standup parameters (disabled because release/standup is out of scope):
+        # base_height = 0.0
+        # head_height = 0.5
+        # stand_still = 1.0
+        # hand_free = 0.5
+
+        # Long-range confirmed-carry reward composition. Internal weights sum
+        # to one for carry_stability and remain separate from outer scales.
+        carry_progress_velocity = 0.70
+        carry_progress_speed_tracking = 0.20
+        carry_progress_heading = 0.10
+        carry_stability_contact = 0.30
+        carry_stability_relative_motion = 0.25
+        carry_stability_box_angular_velocity = 0.15
+        carry_stability_box_upright = 0.15
+        carry_stability_robot_upright = 0.10
+        carry_stability_height = 0.05
 
         target_speed_loco = 0.85
         target_speed_carry = 0.85
@@ -327,6 +350,16 @@ class G1Cfg(LeggedRobotCfg):
         thresh_object2goal = 0.05
         thresh_object2start = 0.5
         target_box_height = 0.72
+
+    class carry_navigation:
+        # Navigation target and state-machine settings for long-range carrying.
+        goal_distance_range = [4.0, 6.0]
+        goal_bearing_offset_deg = [15.0, 75.0]
+        target_carry_speed = 0.60
+        goal_radius = 0.40
+        acquire_time_s = 0.20
+        drop_grace_time_s = 0.30
+        success_dwell_time_s = 0.30
 
     class normalization:
         class obs_scales:
