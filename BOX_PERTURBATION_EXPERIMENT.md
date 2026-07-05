@@ -34,12 +34,20 @@ physics substep. Its length is `|F| * debug_force_draw_scale_m_per_N` (default
 `0.08 m/N`). The console prints the world-frame vector, magnitude in newtons, and
 scheduled peak. This arrow is the injected pulse, not Isaac Gym's net contact force.
 
-For a deterministic one-robot stress test, use `--debug_force_sweep`. It tests all
-five directions once at each beta level `(0.25, 0.50, 0.75, 1.00)`, then increases
-to the next level. With the nominal 1.125 kg box, the capped peak sequence is about
-`2.76, 5.52, 8.28, 10.0 N`. Events are separated by 75 policy steps and still require
-20 consecutive confirmed-carry steps. This mode is evaluation-only and is disabled
-by default during training.
+For a deterministic one-robot stress test, use `--debug_force_sweep`. Each
+`(direction, beta)` cell receives a fresh `carryWith` RSI reset; no pulse is allowed
+until 20 consecutive confirmed-carry policy steps. The beta grid is
+`(0.10, 0.25, 0.50, 0.75)`, giving nominal peaks of about
+`1.10, 2.76, 5.52, 8.28 N` for the 1.125 kg box. Robot DR and observation noise are
+disabled. A cell that cannot enter confirmed carry within 5 seconds is reported as
+`precondition_failed` and receives no force. This mode is evaluation-only.
+
+The terminal reports the external force plus left/right `hand_on_box_proxy` vectors.
+The proxy is the negative of each collision-hand body's net contact force, matching
+the raw signal used by the 17D interaction privileged critic tail. It is not a true
+pairwise wrench; the one-env evaluator additionally audits PhysX hand-box contact
+pairs and their normal `lambda` values. Add `--verbose_force_trace` to print all 20
+physics-substep samples of each pulse.
 
 ## Event and force timing
 
@@ -144,6 +152,30 @@ python play.py \
   --resume_path "{LEGGED_GYM_ROOT_DIR}/resources/ckpt/carrybox.pt" \
   --disable_box_perturb
 ```
+
+## Fair pretrained-vs-interaction-privileged A/B evaluation
+
+Run 5 paired seeds for every direction and beta:
+
+```bash
+python legged_gym/scripts/evaluate_carrybox_boxperturb.py \
+  --baseline_checkpoint resources/ckpt/carrybox.pt \
+  --interaction_checkpoint /path/to/model_41000.pt \
+  --seeds 1 2 3 4 5 \
+  --output_dir logs/boxperturb_ab
+```
+
+Both checkpoints load only their 738D Actor. The evaluation produces:
+
+- `trials.csv`: one row per independent cell and seed;
+- `force_trace.csv`: physics-substep force/contact trace;
+- `summary.csv`: grouped robustness and hand-force statistics;
+- `comparison.json`: paired interaction-minus-baseline differences.
+
+Primary robustness outcomes are confirmed-carry retention, recovery within 1 second,
+drop/fall rate, hand-box relative motion, balance, and 2-second post-pulse task
+continuation. Hand-force magnitude is explanatory rather than a standalone success
+criterion.
 
 ## Validation
 

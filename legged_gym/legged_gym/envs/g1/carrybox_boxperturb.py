@@ -38,6 +38,9 @@ class LeggedRobot(CarryBox):
         self.box_perturb_decision_made_buf = torch.zeros(n, dtype=torch.bool, device=device)
         self.box_perturb_event_count_buf = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_direction_id_buf = torch.full((n,), -1, dtype=torch.long, device=device)
+        self.box_perturb_schedule_confirmed_streak = torch.zeros(
+            n, dtype=torch.long, device=device
+        )
         self.box_perturb_mass_kg = torch.zeros(n, device=device)
         self.box_perturb_cap_used_buf = torch.zeros(n, dtype=torch.bool, device=device)
 
@@ -48,6 +51,12 @@ class LeggedRobot(CarryBox):
         self.box_perturb_recovery_done_buf = torch.zeros(n, dtype=torch.bool, device=device)
         self.box_perturb_debug_sweep_index = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_debug_sweep_cooldown = torch.zeros(n, dtype=torch.long, device=device)
+        self.box_perturb_force_trace = []
+        self.box_perturb_trace_enabled = False
+        self.box_perturb_trace_verbose = False
+        self.box_perturb_trace_phase = "idle"
+        self.box_perturb_trace_metadata = {}
+        self.box_perturb_last_termination_reason = [""] * n
 
         # Run-level counters provide stable rollout metrics even when no episode ends.
         self._perturb_total_decisions = torch.zeros((), device=device)
@@ -73,15 +82,21 @@ class LeggedRobot(CarryBox):
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
 
         self.render()
-        for _ in range(self.cfg.control.decimation):
+        for physics_substep in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions).view(self.torques.shape)
             self.gym.set_dof_actuation_force_tensor(
                 self.sim, gymtorch.unwrap_tensor(self.torques)
             )
             self._apply_box_perturbation_force()
             self.gym.simulate(self.sim)
-            if self.device == "cpu":
+            trace_active = self._box_perturb_trace_is_active()
+            if self.device == "cpu" or trace_active:
                 self.gym.fetch_results(self.sim, True)
+            if trace_active:
+                self.gym.refresh_actor_root_state_tensor(self.sim)
+                self.gym.refresh_rigid_body_state_tensor(self.sim)
+                self.gym.refresh_net_contact_force_tensor(self.sim)
+                self._record_box_perturb_physics_trace(physics_substep)
             self.gym.refresh_dof_state_tensor(self.sim)
 
         termination_ids, termination_privileged_obs, amp_obs_buf = self.post_physics_step()
@@ -153,6 +168,10 @@ class LeggedRobot(CarryBox):
         self._update_recovery_state()
         self._log_applied_force_debug()
 
+        if bool(cfg.evaluation_mode) and bool(cfg.evaluation_manual_schedule):
+            self.extras["perturb"] = self._build_perturb_log_info()
+            return
+
         if bool(cfg.debug_sweep_enabled):
             self._update_debug_force_sweep()
             self.extras["perturb"] = self._build_perturb_log_info()
@@ -188,6 +207,7 @@ class LeggedRobot(CarryBox):
         self.box_perturb_decision_made_buf.zero_()
         self.box_perturb_event_count_buf.zero_()
         self.box_perturb_direction_id_buf.fill_(-1)
+        self.box_perturb_schedule_confirmed_streak.zero_()
         self.box_perturb_cap_used_buf.zero_()
         self.box_perturb_recovery_active_buf.zero_()
         self.box_perturb_recovery_confirmed_streak.zero_()
@@ -216,13 +236,237 @@ class LeggedRobot(CarryBox):
         env_id = int(active_ids[0].item())
         force = applied[env_id]
         magnitude = torch.linalg.vector_norm(force)
+        left_on_box = -self.contact_forces[
+            env_id, int(self.left_hand_net_contact_force_index), :
+        ]
+        right_on_box = -self.contact_forces[
+            env_id, int(self.right_hand_net_contact_force_index), :
+        ]
+        direction = self.box_perturb_direction_world[env_id]
+        resistive = torch.dot(left_on_box + right_on_box, -direction)
         print(
             "[Box perturb applied] "
             f"policy_step={self.common_step_counter} env={env_id} "
             f"force_world_N={force.detach().cpu().tolist()} "
             f"magnitude_N={float(magnitude):.6f} "
-            f"peak_N={float(self.box_perturb_peak_force_N[env_id]):.6f}"
+            f"peak_N={float(self.box_perturb_peak_force_N[env_id]):.6f} "
+            f"left_hand_on_box_proxy_N={left_on_box.detach().cpu().tolist()} "
+            f"left_norm_N={float(torch.linalg.vector_norm(left_on_box)):.6f} "
+            f"right_hand_on_box_proxy_N={right_on_box.detach().cpu().tolist()} "
+            f"right_norm_N={float(torch.linalg.vector_norm(right_on_box)):.6f} "
+            f"resistive_N={float(resistive):.6f}"
         )
+
+    def begin_box_perturb_trace(self, metadata=None, verbose=False):
+        """Start one-env evaluation tracing without changing policy observations."""
+        self.box_perturb_force_trace = []
+        self.box_perturb_trace_metadata = dict(metadata or {})
+        self.box_perturb_trace_verbose = bool(verbose)
+        self.box_perturb_trace_phase = "pre"
+        self.box_perturb_trace_enabled = True
+        self.box_perturb_last_termination_reason[0] = ""
+
+    def set_box_perturb_trace_phase(self, phase):
+        self.box_perturb_trace_phase = str(phase)
+
+    def end_box_perturb_trace(self):
+        self.box_perturb_trace_enabled = False
+        self.box_perturb_trace_phase = "idle"
+        return list(self.box_perturb_force_trace)
+
+    def _box_perturb_trace_is_active(self):
+        return (
+            bool(self.cfg.box_perturbation.evaluation_trace_enabled)
+            and self.box_perturb_trace_enabled
+            and self.num_envs == 1
+        )
+
+    def schedule_explicit_box_perturbation(self, direction_name, beta, env_id=0):
+        """Schedule a deterministic evaluation pulse after the confirmed-carry gate."""
+        if direction_name not in self._DIRECTION_IDS:
+            raise ValueError(f"Unknown perturbation direction: {direction_name}")
+        threshold = int(
+            self.cfg.box_perturbation.stable_confirmed_carry_policy_steps
+        )
+        if int(self.confirmed_carry_streak[env_id].item()) < threshold:
+            raise RuntimeError(
+                "Perturbation requested before confirmed-carry gate: "
+                f"streak={int(self.confirmed_carry_streak[env_id])}, threshold={threshold}"
+            )
+        if int(self.box_perturb_remaining_physics_steps[env_id].item()) != 0:
+            raise RuntimeError("A box perturbation pulse is already active")
+
+        env_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
+        direction_world = torch.zeros((1, 3), device=self.device)
+        if direction_name == "-z_world":
+            direction_world[0, 2] = -1.0
+        else:
+            local_axis = torch.zeros((1, 3), device=self.device)
+            component = 0 if direction_name[-1] == "x" else 1
+            local_axis[0, component] = 1.0 if direction_name[0] == "+" else -1.0
+            direction_world = quat_rotate(
+                self.box_states[env_ids, 3:7], local_axis
+            )
+        beta_tensor = torch.tensor([float(beta)], device=self.device)
+        direction_ids = torch.tensor(
+            [self._DIRECTION_IDS[direction_name]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.set_box_perturb_trace_phase("pulse")
+        self._commit_box_perturbation(
+            env_ids,
+            direction_world,
+            beta_tensor,
+            direction_ids,
+            f"evaluation:{direction_name}",
+        )
+        return float(self.box_perturb_peak_force_N[env_id].item())
+
+    def _pairwise_hand_box_contact_audit(self, env_id=0):
+        result = {
+            "left_pair_count": -1,
+            "right_pair_count": -1,
+            "left_pair_normal_lambda_N": float("nan"),
+            "right_pair_normal_lambda_N": float("nan"),
+        }
+        try:
+            def contact_field(contact, name):
+                if hasattr(contact, name):
+                    return getattr(contact, name)
+                return contact[name]
+
+            contacts = self.gym.get_env_rigid_contacts(self.envs[env_id])
+            box_id = int(self.box_net_contact_force_index)
+            hand_ids = (
+                int(self.left_hand_net_contact_force_index),
+                int(self.right_hand_net_contact_force_index),
+            )
+            counts = [0, 0]
+            normal_loads = [0.0, 0.0]
+            for contact in contacts:
+                pair = {
+                    int(contact_field(contact, "body0")),
+                    int(contact_field(contact, "body1")),
+                }
+                for hand_index, hand_id in enumerate(hand_ids):
+                    if pair == {hand_id, box_id}:
+                        counts[hand_index] += 1
+                        normal_loads[hand_index] += float(
+                            contact_field(contact, "lambda")
+                        )
+            result.update(
+                left_pair_count=counts[0],
+                right_pair_count=counts[1],
+                left_pair_normal_lambda_N=normal_loads[0],
+                right_pair_normal_lambda_N=normal_loads[1],
+            )
+        except Exception as exc:
+            if not getattr(self, "_pairwise_contact_warning_printed", False):
+                print(f"[Box perturb audit] pairwise contacts unavailable: {exc}")
+                self._pairwise_contact_warning_printed = True
+        return result
+
+    def _record_box_perturb_physics_trace(self, physics_substep):
+        env_id = 0
+        box_index = int(self.box_net_contact_force_index)
+        left_index = int(self.left_hand_net_contact_force_index)
+        right_index = int(self.right_hand_net_contact_force_index)
+        f_ext = self.box_perturb_force_tensor[env_id, box_index].detach()
+        left_on_hand = self.contact_forces[env_id, left_index].detach()
+        right_on_hand = self.contact_forces[env_id, right_index].detach()
+        left_on_box = -left_on_hand
+        right_on_box = -right_on_hand
+        combined_on_box = left_on_box + right_on_box
+        box_net_contact = self.contact_forces[env_id, box_index].detach()
+        direction = self.box_perturb_direction_world[env_id].detach()
+        resistive = torch.dot(combined_on_box, -direction)
+        left_norm = torch.linalg.vector_norm(left_on_box)
+        right_norm = torch.linalg.vector_norm(right_on_box)
+        load_asymmetry = torch.abs(left_norm - right_norm) / torch.clamp(
+            left_norm + right_norm, min=1.0e-6
+        )
+        box_vel = self.box_states[env_id, 7:10].detach()
+        box_ang_vel = self.box_states[env_id, 10:13].detach()
+        left_rel = torch.linalg.vector_norm(
+            self.rigid_body_states[env_id, left_index, 7:10] - box_vel
+        )
+        right_rel = torch.linalg.vector_norm(
+            self.rigid_body_states[env_id, right_index, 7:10] - box_vel
+        )
+        threshold = float(self.cfg.interaction_priv.hand_contact_force_threshold)
+        if self.box_perturb_trace_phase == "pulse":
+            audit = self._pairwise_hand_box_contact_audit(env_id)
+        else:
+            audit = {
+                "left_pair_count": -1,
+                "right_pair_count": -1,
+                "left_pair_normal_lambda_N": float("nan"),
+                "right_pair_normal_lambda_N": float("nan"),
+            }
+
+        def vec(prefix, value):
+            values = value.cpu().tolist()
+            return {
+                f"{prefix}_x": values[0],
+                f"{prefix}_y": values[1],
+                f"{prefix}_z": values[2],
+            }
+
+        row = {
+            **self.box_perturb_trace_metadata,
+            "phase": self.box_perturb_trace_phase,
+            "frame": int(self.gym.get_frame_count(self.sim)),
+            "policy_step": int(self.common_step_counter),
+            "physics_substep": int(physics_substep),
+            "elapsed_pulse_physics_steps": int(
+                self.box_perturb_elapsed_physics_steps[env_id].item()
+            ),
+            "beta": float(self.box_perturb_beta[env_id].item()),
+            "box_mass_kg": float(self.box_masses[env_id].item()),
+            "force_peak_N": float(self.box_perturb_peak_force_N[env_id].item()),
+            "confirmed_streak_at_schedule": int(
+                self.box_perturb_schedule_confirmed_streak[env_id].item()
+            ),
+            "f_ext_norm_N": float(torch.linalg.vector_norm(f_ext).item()),
+            "left_hand_on_box_proxy_norm_N": float(left_norm.item()),
+            "right_hand_on_box_proxy_norm_N": float(right_norm.item()),
+            "combined_hand_on_box_proxy_norm_N": float(
+                torch.linalg.vector_norm(combined_on_box).item()
+            ),
+            "box_net_contact_force_norm_N": float(
+                torch.linalg.vector_norm(box_net_contact).item()
+            ),
+            "resistive_hand_force_N": float(resistive.item()),
+            "hand_load_asymmetry": float(load_asymmetry.item()),
+            "left_hand_box_rel_speed_mps": float(left_rel.item()),
+            "right_hand_box_rel_speed_mps": float(right_rel.item()),
+            "left_contact": int(left_norm.item() > threshold),
+            "right_contact": int(right_norm.item() > threshold),
+            "confirmed_carry": int(self.confirmed_carry_buf[env_id].item()),
+            "box_lin_speed_mps": float(torch.linalg.vector_norm(box_vel).item()),
+            "box_ang_speed_radps": float(
+                torch.linalg.vector_norm(box_ang_vel).item()
+            ),
+            **vec("f_ext_world_N", f_ext),
+            **vec("left_hand_on_box_proxy_world_N", left_on_box),
+            **vec("right_hand_on_box_proxy_world_N", right_on_box),
+            **vec("box_net_contact_force_world_N", box_net_contact),
+            **vec("box_lin_vel_world_mps", box_vel),
+            **vec("box_ang_vel_world_radps", box_ang_vel),
+            **audit,
+        }
+        self.box_perturb_force_trace.append(row)
+        if self.box_perturb_trace_verbose and row["f_ext_norm_N"] > 1.0e-6:
+            print(
+                "[ForceTrace] "
+                f"k={row['elapsed_pulse_physics_steps']:02d} "
+                f"Fext={row['f_ext_norm_N']:.4f}N "
+                f"Lhand={row['left_hand_on_box_proxy_norm_N']:.4f}N "
+                f"Rhand={row['right_hand_on_box_proxy_norm_N']:.4f}N "
+                f"resist={row['resistive_hand_force_N']:.4f}N "
+                f"confirmed={row['confirmed_carry']}"
+            )
 
     def _schedule_box_perturbation(self, env_ids):
         cfg = self.cfg.box_perturbation
@@ -266,6 +510,14 @@ class LeggedRobot(CarryBox):
         self, env_ids, direction_world, beta, direction_ids, label
     ):
         cfg = self.cfg.box_perturbation
+        if bool(cfg.evaluation_mode):
+            threshold = int(cfg.stable_confirmed_carry_policy_steps)
+            streaks = self.confirmed_carry_streak[env_ids]
+            if not torch.all(streaks >= threshold):
+                raise AssertionError(
+                    "Evaluation force leakage: perturbation scheduled before "
+                    f"confirmed-carry threshold {threshold}; streaks={streaks.tolist()}"
+                )
         mass = self.box_masses[env_ids]
         uncapped_peak = beta * mass * 9.81
         cap = cfg.force_peak_cap_N
@@ -283,6 +535,9 @@ class LeggedRobot(CarryBox):
         self.box_perturb_mass_kg[env_ids] = mass
         self.box_perturb_cap_used_buf[env_ids] = cap_used
         self.box_perturb_direction_id_buf[env_ids] = direction_ids
+        self.box_perturb_schedule_confirmed_streak[env_ids] = (
+            self.confirmed_carry_streak[env_ids]
+        )
         self.box_perturb_elapsed_physics_steps[env_ids] = 0
         self.box_perturb_remaining_physics_steps[env_ids] = self._pulse_physics_steps()
         self.box_perturb_event_count_buf[env_ids] += 1
@@ -405,11 +660,43 @@ class LeggedRobot(CarryBox):
             self.box_perturb_recovery_done_buf[timeout] = True
             self._perturb_total_recoveries += timeout.float().sum()
 
+    def check_termination(self):
+        """Keep evaluation trials alive on task success while retaining failures."""
+        if bool(self.cfg.box_perturbation.evaluation_ignore_task_success_reset):
+            saved_carry_success = self.carry_success_buf.clone()
+            self.carry_success_buf.zero_()
+            super().check_termination()
+            self.carry_success_buf[:] = saved_carry_success
+            self.success_buf[:] = saved_carry_success
+        else:
+            super().check_termination()
+
     def reset_idx(self, env_ids):
         if len(env_ids) == 0:
             return
         has_buffers = hasattr(self, "box_perturb_event_count_buf")
         if has_buffers:
+            for env_id_tensor in env_ids:
+                env_id = int(env_id_tensor.item())
+                if int(self.episode_length_buf[env_id].item()) > 0:
+                    reasons = []
+                    if bool(self.carry_drop_failure_buf[env_id].item()):
+                        reasons.append("drop")
+                    if bool((self.projected_gravity_box[env_id, 2] > -0.05).item()):
+                        reasons.append("box_tilt")
+                    if bool((self.rigid_body_states[env_id, self.head_index, 2] < 0.6).item()):
+                        reasons.append("head_low")
+                    if bool((self.root_states[env_id, 2] < 0.2).item()):
+                        reasons.append("base_low")
+                    if bool((torch.abs(self.roll[env_id]) > 0.5).item()) or bool(
+                        (torch.abs(self.pitch[env_id]) > 1.1).item()
+                    ):
+                        reasons.append("base_tilt")
+                    if bool(self.time_out_buf[env_id].item()):
+                        reasons.append("timeout")
+                    if not reasons and bool(self.reset_buf[env_id].item()):
+                        reasons.append("other")
+                    self.box_perturb_last_termination_reason[env_id] = "|".join(reasons)
             interrupted_recovery = self.box_perturb_recovery_active_buf[env_ids]
             self._perturb_total_recoveries += interrupted_recovery.float().sum()
             self._perturb_total_completed_episodes += float(len(env_ids))
@@ -443,6 +730,7 @@ class LeggedRobot(CarryBox):
             "box_perturb_remaining_physics_steps",
             "confirmed_carry_streak",
             "box_perturb_event_count_buf",
+            "box_perturb_schedule_confirmed_streak",
             "box_perturb_recovery_confirmed_streak",
             "box_perturb_recovery_elapsed_policy_steps",
             "box_perturb_debug_sweep_cooldown",
@@ -589,3 +877,26 @@ class LeggedRobot(CarryBox):
                 vertices,
                 colors,
             )
+
+            hand_scale = scale
+            for hand_index, hand_color in (
+                (int(self.left_hand_net_contact_force_index), [0.0, 1.0, 1.0]),
+                (int(self.right_hand_net_contact_force_index), [1.0, 0.0, 1.0]),
+            ):
+                hand_force = (
+                    -self.contact_forces[env_id, hand_index]
+                ).detach().cpu().numpy()
+                hand_start = self.rigid_body_states[
+                    env_id, hand_index, :3
+                ].detach().cpu().numpy()
+                hand_end = hand_start + hand_force * hand_scale
+                hand_vertices = np.concatenate((hand_start, hand_end)).astype(
+                    np.float32
+                ).reshape(1, 6)
+                self.gym.add_lines(
+                    self.viewer,
+                    self.envs[env_id],
+                    1,
+                    hand_vertices,
+                    np.asarray(hand_color, dtype=np.float32).reshape(1, 3),
+                )

@@ -42,8 +42,9 @@ def validate(num_envs, rl_device):
     env_cfg, train_cfg = task_registry.get_cfgs(args.task)
     env_cfg.env.num_envs = num_envs
     env_cfg.noise.add_noise = False
-    env_cfg.box_perturbation.debug_force_event = True
-    env_cfg.box_perturbation.manual_stage_override = "C1"
+    env_cfg.box_perturbation.debug_force_event = False
+    env_cfg.box_perturbation.evaluation_mode = True
+    env_cfg.box_perturbation.evaluation_manual_schedule = True
     train_cfg.runner.resume = False
 
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
@@ -61,19 +62,26 @@ def validate(num_envs, rl_device):
     assert env.box_perturb_force_tensor.shape == env.contact_forces.shape
     assert int(env.box_net_contact_force_index) == 2
 
-    # Isolate the scheduler test from contact availability: debug mode deterministically
-    # schedules C1 once the confirmed-carry streak reaches its configured threshold.
+    # Isolate the explicit evaluation gate from contact availability.
     env.confirmed_carry_buf[:] = True
     threshold = env.cfg.box_perturbation.stable_confirmed_carry_policy_steps
-    for _ in range(threshold):
+    for _ in range(threshold - 1):
         env._update_box_perturbation_state()
-    assert torch.all(env.box_perturb_event_count_buf == 1)
-    assert torch.all(env.box_perturb_remaining_physics_steps == 20)
-    assert torch.all(env.box_perturb_beta >= 0.05)
-    assert torch.all(env.box_perturb_beta <= 0.10)
+    assert torch.all(env.box_perturb_event_count_buf == 0)
+    assert torch.all(env.box_perturb_force_tensor == 0)
+    try:
+        env.schedule_explicit_box_perturbation("+box_x", 0.25, env_id=0)
+        raise AssertionError("Explicit event bypassed confirmed-carry gate")
+    except RuntimeError:
+        pass
+    env._update_box_perturbation_state()
+    env.schedule_explicit_box_perturbation("+box_x", 0.25, env_id=0)
+    assert env.box_perturb_event_count_buf[0] == 1
+    assert env.box_perturb_remaining_physics_steps[0] == 20
+    assert env.box_perturb_beta[0] == 0.25
     assert torch.allclose(
-        env.box_perturb_peak_force_N,
-        torch.clamp(env.box_perturb_beta * env.box_masses * 9.81, max=10.0),
+        env.box_perturb_peak_force_N[0],
+        torch.clamp(env.box_perturb_beta[0] * env.box_masses[0] * 9.81, max=10.0),
     )
 
     zero_actions = torch.zeros(num_envs, env.num_actions, device=env.device)
@@ -117,7 +125,7 @@ def validate(num_envs, rl_device):
     print(f"pulse_physics_steps={env._pulse_physics_steps()}")
     print(f"box_mass_kg_mean={float(env.box_masses.mean()):.6f}")
     print(f"force_peak_N_mean={float(env.box_perturb_peak_force_N.mean()):.6f}")
-    print("debug_force_event=True")
+    print("explicit_confirmed_carry_gate_validated=True")
 
 
 if __name__ == "__main__":

@@ -1,22 +1,12 @@
-import sys
-from legged_gym import LEGGED_GYM_ROOT_DIR
 import os
-import sys
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
-import isaacgym
-from legged_gym.envs import *
-from legged_gym.utils import  get_args, export_policy_as_jit, export_jit_to_onnx, load_onnx_policy, task_registry, Logger
+import isaacgym  # noqa: F401
+from legged_gym.envs import *  # noqa: F401,F403
+from legged_gym.utils import get_args, export_policy_as_jit, export_jit_to_onnx, load_onnx_policy, task_registry, set_seed
 
 import numpy as np
 import torch
-import keyboard
-import time
-
-import matplotlib.pyplot as plt
-import numpy as np
-from collections import defaultdict
-from multiprocessing import Process, Value
 
 
 def load_actor_only_for_inference(ppo_runner, checkpoint_path, device):
@@ -131,6 +121,135 @@ def print_carry_phase_debug(env, dones, step, env_id=0):
     )
 
 
+def _disable_boxperturb_eval_randomization(env_cfg):
+    env_cfg.env.test = False
+    env_cfg.noise.add_noise = False
+    env_cfg.asset.box.reset_mode = "random"
+    env_cfg.asset.box.skill_init_prob = [0.0, 0.0, 1.0, 0.0]
+    for name in (
+        "randomize_actuation_offset",
+        "randomize_motor_strength",
+        "randomize_payload_mass",
+        "randomize_com_displacement",
+        "randomize_link_mass",
+        "randomize_friction",
+        "randomize_restitution",
+        "randomize_kp",
+        "randomize_kd",
+        "randomize_initial_joint_pos",
+        "disturbance",
+        "delay",
+        "push_robots",
+    ):
+        setattr(env_cfg.domain_rand, name, False)
+
+
+def run_boxperturb_visual_sweep(env, policy, args):
+    cfg = env.cfg.box_perturbation
+    betas = tuple(cfg.debug_sweep_beta_values)
+    directions = tuple(cfg.debug_sweep_directions)
+    seed = 1 if args.seed is None else int(args.seed)
+    precondition_steps = int(
+        round(float(cfg.evaluation_precondition_timeout_s) / env.dt)
+    )
+    recovery_steps = env._recovery_policy_steps()
+    post_steps = int(round(float(cfg.evaluation_post_window_s) / env.dt))
+    total = len(betas) * len(directions)
+
+    test_cells = [(beta, direction) for beta in betas for direction in directions]
+    for test_index, (beta, direction) in enumerate(test_cells, start=1):
+        set_seed(seed)
+        obs, _ = env.reset()
+        env.begin_box_perturb_trace(
+            {
+                "model": "play",
+                "seed": seed,
+                "direction": direction,
+                "requested_beta": float(beta),
+                "test_index": test_index,
+            },
+            verbose=args.verbose_force_trace,
+        )
+        precondition_ok = False
+        dones = torch.zeros(1, device=env.device)
+        for _ in range(precondition_steps):
+            actions = policy(obs.detach())
+            obs, _, _, dones, _, _, _, _ = env.step(actions.detach())
+            if bool(dones[0].item()):
+                break
+            if int(env.confirmed_carry_streak[0].item()) >= int(
+                cfg.stable_confirmed_carry_policy_steps
+            ):
+                precondition_ok = True
+                break
+
+        if not precondition_ok:
+            trace = env.end_box_perturb_trace()
+            print(
+                f"[SweepResult] test={test_index}/{total} seed={seed} "
+                f"direction={direction} beta={float(beta):.2f} "
+                f"status=precondition_failed trace_rows={len(trace)}"
+            )
+            continue
+
+        peak = env.schedule_explicit_box_perturbation(direction, beta, env_id=0)
+        pulse_finished = False
+        after_pulse_steps = 0
+        recovery_streak = 0
+        recovery_success = False
+        recovery_time_steps = -1
+        pulse_confirmed = []
+        post_confirmed = []
+        goal_start = float(env.object2goal_dist_xy[0].item())
+        termination_reason = ""
+
+        while after_pulse_steps < recovery_steps + post_steps:
+            if pulse_finished and after_pulse_steps >= recovery_steps:
+                env.set_box_perturb_trace_phase("post")
+            actions = policy(obs.detach())
+            obs, _, _, dones, _, _, _, _ = env.step(actions.detach())
+            if not pulse_finished:
+                pulse_confirmed.append(float(env.confirmed_carry_buf[0].item()))
+                if int(env.box_perturb_remaining_physics_steps[0].item()) == 0:
+                    pulse_finished = True
+                    env.set_box_perturb_trace_phase("recovery")
+            else:
+                after_pulse_steps += 1
+                if after_pulse_steps <= recovery_steps:
+                    if bool(env.confirmed_carry_buf[0].item()):
+                        recovery_streak += 1
+                    else:
+                        recovery_streak = 0
+                    if not recovery_success and recovery_streak >= int(
+                        cfg.recovery_confirmed_carry_steps
+                    ):
+                        recovery_success = True
+                        recovery_time_steps = after_pulse_steps
+                else:
+                    post_confirmed.append(float(env.confirmed_carry_buf[0].item()))
+            if bool(dones[0].item()):
+                termination_reason = env.box_perturb_last_termination_reason[0]
+                break
+
+        goal_end = (
+            float(env.object2goal_dist_xy[0].item())
+            if not termination_reason
+            else float("nan")
+        )
+        trace = env.end_box_perturb_trace()
+        pulse_hold = float(np.mean(pulse_confirmed)) if pulse_confirmed else 0.0
+        post_ratio = float(np.mean(post_confirmed)) if post_confirmed else 0.0
+        recovery_time_s = (
+            recovery_time_steps * env.dt if recovery_time_steps >= 0 else float("nan")
+        )
+        print(
+            f"[SweepResult] test={test_index}/{total} seed={seed} "
+            f"direction={direction} beta={float(beta):.2f} peak={peak:.3f}N "
+            f"pulse_hold={pulse_hold:.3f} recovery={int(recovery_success)} "
+            f"recovery_time_s={recovery_time_s:.3f} post_confirmed={post_ratio:.3f} "
+            f"goal_progress_m={goal_start - goal_end:.3f} "
+            f"termination={termination_reason or 'none'} trace_rows={len(trace)}"
+        )
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
@@ -153,13 +272,22 @@ def play(args):
     if args.task == 'carrybox_boxperturb_resume':
         env_cfg.box_perturbation.enabled = not args.disable_box_perturb
         env_cfg.box_perturbation.debug_force_event = args.debug_force_event
-        env_cfg.box_perturbation.debug_sweep_enabled = args.debug_force_sweep
+        # Sweep scheduling is driven explicitly below so every cell gets a fresh reset.
+        env_cfg.box_perturbation.debug_sweep_enabled = False
         env_cfg.box_perturbation.debug_draw_force = (
             args.debug_force_event or args.debug_force_sweep
         )
         if args.debug_force_sweep:
             env_cfg.env.num_envs = 1
             env_cfg.env.episode_length_s = 120
+            env_cfg.box_perturbation.evaluation_mode = True
+            env_cfg.box_perturbation.evaluation_manual_schedule = True
+            env_cfg.box_perturbation.evaluation_trace_enabled = True
+            env_cfg.box_perturbation.evaluation_verbose_substeps = (
+                args.verbose_force_trace
+            )
+            env_cfg.box_perturbation.evaluation_ignore_task_success_reset = True
+            _disable_boxperturb_eval_randomization(env_cfg)
         # The bundled nominal checkpoint has a 738-D actor but a legacy 126-D
         # critic. Evaluation needs only the compatible actor.
         train_cfg.runner.resume = False
@@ -189,6 +317,10 @@ def play(args):
             ppo_runner, args.resume_path, device=env.device
         )
     policy = ppo_runner.get_inference_policy(device=env.device)
+
+    if args.task == 'carrybox_boxperturb_resume' and args.debug_force_sweep:
+        run_boxperturb_visual_sweep(env, policy, args)
+        return
     
     # export policy as a jit & onnx module (used to run it from C++)
     if EXPORT_POLICY:
@@ -208,7 +340,7 @@ def play(args):
         env.commands[:, 0] = 0.8
         env.commands[:, 1] = 0.0
         env.commands[:, 2] = 0.0
-        result = env.gym.fetch_results(env.sim, True)
+        env.gym.fetch_results(env.sim, True)
         actions = policy(obs.detach())
         if args.play_dataset:
             env.play_dataset_step(i)

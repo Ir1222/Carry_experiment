@@ -72,7 +72,7 @@ class G1Cfg(CarryBoxResumeCfg):
 
         recovery_window_s = 1.0
         recovery_confirmed_carry_steps = 5
-        debug_force_event = True
+        debug_force_event = False
         debug_draw_force = False
         # Viewer arrow length is |F| times this scale.
         debug_force_draw_scale_m_per_N = 0.08
@@ -83,7 +83,7 @@ class G1Cfg(CarryBoxResumeCfg):
         # Evaluation-only deterministic sweep. For every beta level, test all
         # five directions once before increasing the force level.
         debug_sweep_enabled = False
-        debug_sweep_beta_values = (0.25, 0.50, 0.75, 1.00)
+        debug_sweep_beta_values = (0.10, 0.25, 0.50, 0.75)
         debug_sweep_directions = (
             "+box_x",
             "-box_x",
@@ -92,6 +92,15 @@ class G1Cfg(CarryBoxResumeCfg):
             "-z_world",
         )
         debug_sweep_inter_event_policy_steps = 75
+
+        # Evaluation-only instrumentation. Disabled for training.
+        evaluation_mode = False
+        evaluation_manual_schedule = False
+        evaluation_trace_enabled = False
+        evaluation_verbose_substeps = False
+        evaluation_ignore_task_success_reset = False
+        evaluation_precondition_timeout_s = 5.0
+        evaluation_post_window_s = 2.0
 
 
 class G1CfgPPO(CarryBoxResumeCfgPPO):
