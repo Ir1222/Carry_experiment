@@ -206,6 +206,7 @@ def get_args():
         {"name": "--play_dataset", "action": "store_true", "default": False, "help": "Visualize the reference."},
         {"name": "--disable_box_perturb", "action": "store_true", "default": False, "help": "Disable box-COM perturbations during play/evaluation."},
         {"name": "--debug_force_event", "action": "store_true", "default": False, "help": "Force the gated box perturbation event to trigger during play/evaluation."},
+        {"name": "--debug_force_sweep", "action": "store_true", "default": False, "help": "Run a deterministic one-robot increasing-force sweep over every box direction."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

@@ -153,7 +153,13 @@ def play(args):
     if args.task == 'carrybox_boxperturb_resume':
         env_cfg.box_perturbation.enabled = not args.disable_box_perturb
         env_cfg.box_perturbation.debug_force_event = args.debug_force_event
-        env_cfg.box_perturbation.debug_draw_force = args.debug_force_event
+        env_cfg.box_perturbation.debug_sweep_enabled = args.debug_force_sweep
+        env_cfg.box_perturbation.debug_draw_force = (
+            args.debug_force_event or args.debug_force_sweep
+        )
+        if args.debug_force_sweep:
+            env_cfg.env.num_envs = 1
+            env_cfg.env.episode_length_s = 120
         # The bundled nominal checkpoint has a 738-D actor but a legacy 126-D
         # critic. Evaluation needs only the compatible actor.
         train_cfg.runner.resume = False

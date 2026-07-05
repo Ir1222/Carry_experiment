@@ -80,6 +80,19 @@ class G1Cfg(CarryBoxResumeCfg):
         debug_force_draw_max_envs = 10
         debug_force_log_interval_policy_steps = 1
 
+        # Evaluation-only deterministic sweep. For every beta level, test all
+        # five directions once before increasing the force level.
+        debug_sweep_enabled = False
+        debug_sweep_beta_values = (0.25, 0.50, 0.75, 1.00)
+        debug_sweep_directions = (
+            "+box_x",
+            "-box_x",
+            "+box_y",
+            "-box_y",
+            "-z_world",
+        )
+        debug_sweep_inter_event_policy_steps = 75
+
 
 class G1CfgPPO(CarryBoxResumeCfgPPO):
     class runner(CarryBoxResumeCfgPPO.runner):

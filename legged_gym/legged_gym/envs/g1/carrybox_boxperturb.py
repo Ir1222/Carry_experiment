@@ -46,6 +46,8 @@ class LeggedRobot(CarryBox):
         self.box_perturb_recovery_elapsed_policy_steps = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_recovery_success_buf = torch.zeros(n, dtype=torch.bool, device=device)
         self.box_perturb_recovery_done_buf = torch.zeros(n, dtype=torch.bool, device=device)
+        self.box_perturb_debug_sweep_index = torch.zeros(n, dtype=torch.long, device=device)
+        self.box_perturb_debug_sweep_cooldown = torch.zeros(n, dtype=torch.long, device=device)
 
         # Run-level counters provide stable rollout metrics even when no episode ends.
         self._perturb_total_decisions = torch.zeros((), device=device)
@@ -151,6 +153,11 @@ class LeggedRobot(CarryBox):
         self._update_recovery_state()
         self._log_applied_force_debug()
 
+        if bool(cfg.debug_sweep_enabled):
+            self._update_debug_force_sweep()
+            self.extras["perturb"] = self._build_perturb_log_info()
+            return
+
         eligible = (
             (self.confirmed_carry_streak >= int(cfg.stable_confirmed_carry_policy_steps))
             & ~self.box_perturb_decision_made_buf
@@ -187,6 +194,8 @@ class LeggedRobot(CarryBox):
         self.box_perturb_recovery_elapsed_policy_steps.zero_()
         self.box_perturb_recovery_success_buf.zero_()
         self.box_perturb_recovery_done_buf.zero_()
+        self.box_perturb_debug_sweep_index.zero_()
+        self.box_perturb_debug_sweep_cooldown.zero_()
 
     def _log_applied_force_debug(self):
         cfg = self.cfg.box_perturbation
@@ -249,6 +258,14 @@ class LeggedRobot(CarryBox):
                 local_axis[:, component] = sign
                 direction_world[mask] = quat_rotate(box_quat[mask], local_axis)
 
+        self._commit_box_perturbation(
+            env_ids, direction_world, beta, direction_ids, stage_name
+        )
+
+    def _commit_box_perturbation(
+        self, env_ids, direction_world, beta, direction_ids, label
+    ):
+        cfg = self.cfg.box_perturbation
         mass = self.box_masses[env_ids]
         uncapped_peak = beta * mass * 9.81
         cap = cfg.force_peak_cap_N
@@ -270,6 +287,7 @@ class LeggedRobot(CarryBox):
         self.box_perturb_remaining_physics_steps[env_ids] = self._pulse_physics_steps()
         self.box_perturb_event_count_buf[env_ids] += 1
         self.box_perturb_recovery_success_buf[env_ids] = False
+        self.box_perturb_recovery_done_buf[env_ids] = False
 
         count = float(env_ids.numel())
         self._perturb_total_events += count
@@ -278,13 +296,71 @@ class LeggedRobot(CarryBox):
         self._perturb_total_mass_kg += mass.sum()
         self._perturb_total_cap_used += cap_used.float().sum()
 
-        if bool(cfg.debug_force_event):
+        if bool(cfg.debug_force_event) or bool(cfg.debug_sweep_enabled):
             first = int(env_ids[0].item())
             print(
                 "[Box perturb debug] "
-                f"stage={stage_name} env={first} direction_id={int(direction_ids[0])} "
+                f"label={label} env={first} direction_id={int(direction_ids[0])} "
                 f"beta={float(beta[0]):.4f} mass_kg={float(mass[0]):.4f} "
                 f"peak_N={float(peak[0]):.4f} cap_used={bool(cap_used[0])}"
+            )
+
+    def _update_debug_force_sweep(self):
+        """Deterministic one-env evaluation sweep; never used by training defaults."""
+        cfg = self.cfg.box_perturbation
+        self.box_perturb_debug_sweep_cooldown[:] = torch.clamp(
+            self.box_perturb_debug_sweep_cooldown - 1, min=0
+        )
+        directions = tuple(cfg.debug_sweep_directions)
+        betas = tuple(cfg.debug_sweep_beta_values)
+        total_tests = len(directions) * len(betas)
+        eligible = (
+            (self.confirmed_carry_streak >= int(cfg.stable_confirmed_carry_policy_steps))
+            & (self.box_perturb_remaining_physics_steps == 0)
+            & ~self.box_perturb_recovery_active_buf
+            & (self.box_perturb_debug_sweep_cooldown == 0)
+            & (self.box_perturb_debug_sweep_index < total_tests)
+        )
+        env_ids = torch.nonzero(eligible, as_tuple=False).flatten()
+        for env_id_tensor in env_ids:
+            env_id = int(env_id_tensor.item())
+            test_index = int(self.box_perturb_debug_sweep_index[env_id].item())
+            direction_name = directions[test_index % len(directions)]
+            beta_level = test_index // len(directions)
+            beta_value = float(betas[beta_level])
+            selected_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
+            direction_world = torch.zeros((1, 3), device=self.device)
+            if direction_name == "-z_world":
+                direction_world[0, 2] = -1.0
+            else:
+                local_axis = torch.zeros((1, 3), device=self.device)
+                axis_name = direction_name[-1]
+                component = 0 if axis_name == "x" else 1
+                local_axis[0, component] = 1.0 if direction_name[0] == "+" else -1.0
+                direction_world = quat_rotate(
+                    self.box_states[selected_ids, 3:7], local_axis
+                )
+            beta = torch.tensor([beta_value], device=self.device)
+            direction_ids = torch.tensor(
+                [self._DIRECTION_IDS[direction_name]],
+                dtype=torch.long,
+                device=self.device,
+            )
+            print(
+                "[Box perturb sweep] "
+                f"test={test_index + 1}/{total_tests} beta_level={beta_level + 1}/{len(betas)} "
+                f"direction={direction_name} beta={beta_value:.3f}"
+            )
+            self._commit_box_perturbation(
+                selected_ids,
+                direction_world,
+                beta,
+                direction_ids,
+                f"sweep:{direction_name}",
+            )
+            self.box_perturb_debug_sweep_index[env_id] += 1
+            self.box_perturb_debug_sweep_cooldown[env_id] = int(
+                cfg.debug_sweep_inter_event_policy_steps
             )
 
     def _update_recovery_state(self):
@@ -369,6 +445,7 @@ class LeggedRobot(CarryBox):
             "box_perturb_event_count_buf",
             "box_perturb_recovery_confirmed_streak",
             "box_perturb_recovery_elapsed_policy_steps",
+            "box_perturb_debug_sweep_cooldown",
         ):
             getattr(self, name)[env_ids] = 0
         for name in (

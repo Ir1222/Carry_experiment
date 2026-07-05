@@ -34,6 +34,13 @@ physics substep. Its length is `|F| * debug_force_draw_scale_m_per_N` (default
 `0.08 m/N`). The console prints the world-frame vector, magnitude in newtons, and
 scheduled peak. This arrow is the injected pulse, not Isaac Gym's net contact force.
 
+For a deterministic one-robot stress test, use `--debug_force_sweep`. It tests all
+five directions once at each beta level `(0.25, 0.50, 0.75, 1.00)`, then increases
+to the next level. With the nominal 1.125 kg box, the capped peak sequence is about
+`2.76, 5.52, 8.28, 10.0 N`. Events are separated by 75 policy steps and still require
+20 consecutive confirmed-carry steps. This mode is evaluation-only and is disabled
+by default during training.
+
 ## Event and force timing
 
 The base `post_physics_step()` refreshes simulator tensors and updates
