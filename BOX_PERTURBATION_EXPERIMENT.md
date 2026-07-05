@@ -28,6 +28,12 @@ or recovery window immediately, preventing force leakage if the value is changed
 runtime. `debug_force_event` is separate: it makes the one-time probability sample
 succeed but only when the master gate is enabled.
 
+Set `debug_draw_force = True` for viewer diagnostics. An orange arrow starts at the
+box COM and shows the instantaneous commanded external force from the most recent
+physics substep. Its length is `|F| * debug_force_draw_scale_m_per_N` (default
+`0.08 m/N`). The console prints the world-frame vector, magnitude in newtons, and
+scheduled peak. This arrow is the injected pulse, not Isaac Gym's net contact force.
+
 ## Event and force timing
 
 The base `post_physics_step()` refreshes simulator tensors and updates

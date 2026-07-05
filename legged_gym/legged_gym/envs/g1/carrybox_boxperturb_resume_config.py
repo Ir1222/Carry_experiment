@@ -73,6 +73,12 @@ class G1Cfg(CarryBoxResumeCfg):
         recovery_window_s = 1.0
         recovery_confirmed_carry_steps = 5
         debug_force_event = True
+        debug_draw_force = False
+        # Viewer arrow length is |F| times this scale.
+        debug_force_draw_scale_m_per_N = 0.08
+        debug_force_arrow_head_length_m = 0.08
+        debug_force_draw_max_envs = 10
+        debug_force_log_interval_policy_steps = 1
 
 
 class G1CfgPPO(CarryBoxResumeCfgPPO):

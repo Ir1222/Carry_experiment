@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 
 from isaacgym import gymapi, gymtorch
@@ -62,6 +63,7 @@ class LeggedRobot(CarryBox):
             "CarryBox actor creation order changed; expected box rigid-body index 2, got "
             f"{int(self.box_net_contact_force_index)}"
         )
+        self.debug_viz = bool(self.cfg.box_perturbation.debug_draw_force)
 
     def step(self, actions):
         """Apply the pulse before every physics simulate call in the decimation loop."""
@@ -147,6 +149,7 @@ class LeggedRobot(CarryBox):
         )
 
         self._update_recovery_state()
+        self._log_applied_force_debug()
 
         eligible = (
             (self.confirmed_carry_streak >= int(cfg.stable_confirmed_carry_policy_steps))
@@ -184,6 +187,33 @@ class LeggedRobot(CarryBox):
         self.box_perturb_recovery_elapsed_policy_steps.zero_()
         self.box_perturb_recovery_success_buf.zero_()
         self.box_perturb_recovery_done_buf.zero_()
+
+    def _log_applied_force_debug(self):
+        cfg = self.cfg.box_perturbation
+        interval = int(cfg.debug_force_log_interval_policy_steps)
+        if not bool(cfg.debug_draw_force) or interval <= 0:
+            return
+        if self.common_step_counter % interval != 0:
+            return
+        applied = self.box_perturb_force_tensor[
+            :, int(self.box_net_contact_force_index), :
+        ]
+        active_ids = torch.nonzero(
+            torch.linalg.vector_norm(applied, dim=-1) > 1.0e-6,
+            as_tuple=False,
+        ).flatten()
+        if active_ids.numel() == 0:
+            return
+        env_id = int(active_ids[0].item())
+        force = applied[env_id]
+        magnitude = torch.linalg.vector_norm(force)
+        print(
+            "[Box perturb applied] "
+            f"policy_step={self.common_step_counter} env={env_id} "
+            f"force_world_N={force.detach().cpu().tolist()} "
+            f"magnitude_N={float(magnitude):.6f} "
+            f"peak_N={float(self.box_perturb_peak_force_N[env_id]):.6f}"
+        )
 
     def _schedule_box_perturbation(self, env_ids):
         cfg = self.cfg.box_perturbation
@@ -430,3 +460,55 @@ class LeggedRobot(CarryBox):
             ).float().mean(),
             "recovery_window_fraction": self.box_perturb_recovery_active_buf.float().mean(),
         }
+
+    def _draw_debug_vis(self):
+        """Draw the latest commanded external force as an arrow at the box COM."""
+        super()._draw_debug_vis()
+        cfg = self.cfg.box_perturbation
+        if not bool(cfg.debug_draw_force):
+            return
+
+        applied = self.box_perturb_force_tensor[
+            :, int(self.box_net_contact_force_index), :
+        ]
+        scale = float(cfg.debug_force_draw_scale_m_per_N)
+        max_envs = min(self.num_envs, int(cfg.debug_force_draw_max_envs))
+        color = np.asarray([1.0, 0.25, 0.0], dtype=np.float32)
+
+        for env_id in range(max_envs):
+            force = applied[env_id].detach().cpu().numpy()
+            magnitude = float(np.linalg.norm(force))
+            if magnitude <= 1.0e-6:
+                continue
+
+            direction = force / magnitude
+            start = self.box_states[env_id, :3].detach().cpu().numpy()
+            end = start + force * scale
+
+            reference = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+            if abs(float(np.dot(direction, reference))) > 0.9:
+                reference = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            side = np.cross(direction, reference)
+            side /= max(float(np.linalg.norm(side)), 1.0e-6)
+
+            shaft_length = magnitude * scale
+            head_length = min(
+                float(cfg.debug_force_arrow_head_length_m),
+                max(0.25 * shaft_length, 0.01),
+            )
+            head_width = 0.5 * head_length
+            head_base = end - direction * head_length
+            left = head_base + side * head_width
+            right = head_base - side * head_width
+
+            vertices = np.stack(
+                (start, end, end, left, end, right), axis=0
+            ).astype(np.float32).reshape(3, 6)
+            colors = np.repeat(color.reshape(1, 3), 3, axis=0)
+            self.gym.add_lines(
+                self.viewer,
+                self.envs[env_id],
+                3,
+                vertices,
+                colors,
+            )
