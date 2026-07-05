@@ -140,6 +140,7 @@ def play(args):
     env_cfg.domain_rand.delay = False
     env_cfg.domain_rand.push_robots = False
     train_cfg.runner.resume = True
+    actor_only_tasks = ('carrybox', 'carrybox_boxperturb_resume')
 
     # carrybox
     if args.task == 'carrybox':
@@ -148,6 +149,12 @@ def play(args):
         env_cfg.env.episode_length_s = 10
         # Play only needs the actor. Load it separately so old 126-D critic
         # checkpoints can run with the current 143-D carry-phase environment.
+        train_cfg.runner.resume = False
+    if args.task == 'carrybox_boxperturb_resume':
+        env_cfg.box_perturbation.enabled = not args.disable_box_perturb
+        env_cfg.box_perturbation.debug_force_event = args.debug_force_event
+        # The bundled nominal checkpoint has a 738-D actor but a legacy 126-D
+        # critic. Evaluation needs only the compatible actor.
         train_cfg.runner.resume = False
     # sitdown
     if args.task == 'sitdown' or args.task == 'liedown':
@@ -170,7 +177,7 @@ def play(args):
 
     # load policy
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
-    if args.task == 'carrybox' and not args.play_dataset:
+    if args.task in actor_only_tasks and not args.play_dataset:
         load_actor_only_for_inference(
             ppo_runner, args.resume_path, device=env.device
         )

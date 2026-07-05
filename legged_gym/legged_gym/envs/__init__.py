@@ -40,6 +40,10 @@ from .g1.carrybox_config import G1CfgPPO as G1CarryBoxCfgPPO
 from .g1.carrybox_resume_config import G1Cfg as G1CarryBoxResumeCfg
 from .g1.carrybox_resume_config import G1CfgPPO as G1CarryBoxResumeCfgPPO
 
+from .g1.carrybox_boxperturb import LeggedRobot as G1CarryBoxBoxPerturb
+from .g1.carrybox_boxperturb_resume_config import G1Cfg as G1CarryBoxBoxPerturbCfg
+from .g1.carrybox_boxperturb_resume_config import G1CfgPPO as G1CarryBoxBoxPerturbCfgPPO
+
 from .g1.carrybox_boxperturb_force_reward import LeggedRobot as G1CarryBoxForceReward
 from .g1.carrybox_boxperturb_force_reward_resume_config import G1Cfg as G1CarryBoxForceRewardCfg
 from .g1.carrybox_boxperturb_force_reward_resume_config import G1CfgPPO as G1CarryBoxForceRewardCfgPPO
@@ -64,6 +68,12 @@ from .g1.styleloco_highknee_config import G1CfgPPO as G1StyleLocoHighKneeCfgPPO
 
 task_registry.register( "carrybox", G1CarryBox, G1CarryBoxCfg(), G1CarryBoxCfgPPO() )
 task_registry.register( "carrybox_resume", G1CarryBox, G1CarryBoxResumeCfg(), G1CarryBoxResumeCfgPPO() )
+task_registry.register(
+    "carrybox_boxperturb_resume",
+    G1CarryBoxBoxPerturb,
+    G1CarryBoxBoxPerturbCfg(),
+    G1CarryBoxBoxPerturbCfgPPO(),
+)
 task_registry.register(
     "carrybox_boxperturb_force_reward_resume",
     G1CarryBoxForceReward,

@@ -204,6 +204,8 @@ def get_args():
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--play_dataset", "action": "store_true", "default": False, "help": "Visualize the reference."},
+        {"name": "--disable_box_perturb", "action": "store_true", "default": False, "help": "Disable box-COM perturbations during play/evaluation."},
+        {"name": "--debug_force_event", "action": "store_true", "default": False, "help": "Force the gated box perturbation event to trigger during play/evaluation."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(
@@ -426,5 +428,3 @@ class Return_Onnx(torch.nn.Module):
             output_names=["estvalues"],
             dynamic_axes={},
         )
-        
-    
