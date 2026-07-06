@@ -325,10 +325,16 @@ class LeggedRobot(BaseTask):
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.gravity_termination_buf = torch.any(torch.norm(self.projected_gravity[:, 0:2], dim=-1, keepdim=True) > 0.8, dim=1)
 
-        # Long-range carry success replaces the legacy place-and-release success:
-        # the box must remain in confirmed carry inside the XY goal radius for
-        # the configured dwell time. Drop failure and success are mutually exclusive.
-        self.success_buf[:] = self.carry_success_buf
+        if self.test:
+            non_tilt = torch.norm(self.projected_gravity_box[:, 0:2], dim=-1) < 0.2
+            place_pos = self.object2goal_dist_xyz < 0.1
+        else:
+            non_tilt = torch.norm(self.projected_gravity_box[:, 0:2], dim=-1) < 0.1
+            place_pos = self.object2goal_dist_xyz < self.cfg.rewards.thresh_object2goal
+        self.success_buf = non_tilt & place_pos
+
+        # Long-range carry success (temporarily disabled):
+        # self.success_buf[:] = self.carry_success_buf
 
         self.reset_buf |= self.time_out_buf
         self.reset_buf |= self.rigid_body_states[:, self.head_index, 2] < 0.6
@@ -340,8 +346,9 @@ class LeggedRobot(BaseTask):
 
         if self.box_cfg.box_termination:
             self.reset_buf |= (self.projected_gravity_box[:, 2] > -0.05)
-        self.reset_buf |= self.carry_drop_failure_buf
-        self.reset_buf |= self.success_buf
+        # Long-range carry termination (temporarily disabled):
+        # self.reset_buf |= self.carry_drop_failure_buf
+        # self.reset_buf |= self.success_buf
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -442,28 +449,23 @@ class LeggedRobot(BaseTask):
             torch.sum(self.lifted_bimanual_contact_episode_sum[env_ids])
             / torch.clamp(lifted_samples, min=1.0)
         )
-        post_acquire_samples = torch.sum(self.post_acquire_episode_count[env_ids])
-        acquired_samples = torch.sum(self.carry_acquired_episode_sum[env_ids])
-        self.extras["episode"]["carry_acquired_ratio"] = torch.mean(
-            self.carry_acquired_episode_sum[env_ids] / episode_lengths
-        )
-        self.extras["episode"]["post_acquire_confirmed_ratio"] = (
-            torch.sum(self.post_acquire_confirmed_episode_sum[env_ids])
-            / torch.clamp(post_acquire_samples, min=1.0)
-        )
-        self.extras["episode"]["box_goal_distance_xy"] = torch.mean(
-            self.box_goal_distance_episode_sum[env_ids] / episode_lengths
-        )
-        self.extras["episode"]["box_velocity_toward_goal"] = (
-            torch.sum(self.box_forward_velocity_episode_sum[env_ids])
-            / torch.clamp(acquired_samples, min=1.0)
-        )
-        self.extras["episode"]["carry_drop_rate"] = torch.mean(
-            self.carry_drop_failure_buf[env_ids].float()
-        )
-        self.extras["episode"]["carry_success_rate"] = torch.mean(
-            self.success_buf[env_ids].float()
-        )
+        # Long-range carry episode metrics (temporarily disabled):
+        # post_acquire_samples = torch.sum(self.post_acquire_episode_count[env_ids])
+        # acquired_samples = torch.sum(self.carry_acquired_episode_sum[env_ids])
+        # self.extras["episode"]["carry_acquired_ratio"] = torch.mean(
+        #     self.carry_acquired_episode_sum[env_ids] / episode_lengths)
+        # self.extras["episode"]["post_acquire_confirmed_ratio"] = (
+        #     torch.sum(self.post_acquire_confirmed_episode_sum[env_ids])
+        #     / torch.clamp(post_acquire_samples, min=1.0))
+        # self.extras["episode"]["box_goal_distance_xy"] = torch.mean(
+        #     self.box_goal_distance_episode_sum[env_ids] / episode_lengths)
+        # self.extras["episode"]["box_velocity_toward_goal"] = (
+        #     torch.sum(self.box_forward_velocity_episode_sum[env_ids])
+        #     / torch.clamp(acquired_samples, min=1.0))
+        # self.extras["episode"]["carry_drop_rate"] = torch.mean(
+        #     self.carry_drop_failure_buf[env_ids].float())
+        # self.extras["episode"]["carry_success_rate"] = torch.mean(
+        #     self.success_buf[env_ids].float())
         self.carry_phase_episode_sum[env_ids] = 0.0
         self.confirmed_carry_episode_sum[env_ids] = 0.0
         self.box_clearance_episode_sum[env_ids] = 0.0
@@ -473,21 +475,22 @@ class LeggedRobot(BaseTask):
         self.hand_box_rel_motion_violation_episode_sum[env_ids] = 0.0
         self.lifted_bimanual_contact_episode_sum[env_ids] = 0.0
         self.lifted_episode_count[env_ids] = 0.0
-        self.carry_acquired_episode_sum[env_ids] = 0.0
-        self.post_acquire_confirmed_episode_sum[env_ids] = 0.0
-        self.post_acquire_episode_count[env_ids] = 0.0
-        self.box_goal_distance_episode_sum[env_ids] = 0.0
-        self.box_forward_velocity_episode_sum[env_ids] = 0.0
-        self.carry_confirmed_streak[env_ids] = 0
-        self.carry_drop_streak[env_ids] = 0
-        self.carry_success_streak[env_ids] = 0
-        self.carry_acquired_buf[env_ids] = False
-        self.carry_drop_failure_buf[env_ids] = False
-        self.carry_success_buf[env_ids] = False
-        self.carry_phase_buf[env_ids] = False
-        self.confirmed_carry_buf[env_ids] = False
-        self.box_forward_velocity_buf[env_ids] = 0.0
-        self.success_buf[env_ids] = False
+        # Long-range carry buffer reset (temporarily disabled):
+        # self.carry_acquired_episode_sum[env_ids] = 0.0
+        # self.post_acquire_confirmed_episode_sum[env_ids] = 0.0
+        # self.post_acquire_episode_count[env_ids] = 0.0
+        # self.box_goal_distance_episode_sum[env_ids] = 0.0
+        # self.box_forward_velocity_episode_sum[env_ids] = 0.0
+        # self.carry_confirmed_streak[env_ids] = 0
+        # self.carry_drop_streak[env_ids] = 0
+        # self.carry_success_streak[env_ids] = 0
+        # self.carry_acquired_buf[env_ids] = False
+        # self.carry_drop_failure_buf[env_ids] = False
+        # self.carry_success_buf[env_ids] = False
+        # self.carry_phase_buf[env_ids] = False
+        # self.confirmed_carry_buf[env_ids] = False
+        # self.box_forward_velocity_buf[env_ids] = 0.0
+        # self.success_buf[env_ids] = False
         self.episode_length_buf[env_ids] = 0
 
     def _update_carry_phase(self):
@@ -543,61 +546,49 @@ class LeggedRobot(BaseTask):
             self.carry_phase_buf.zero_()
         self.confirmed_carry_buf[:] = self.carry_phase_buf & both_contact
 
-        # Long-range carry state machine. Acquisition is latched after a short
-        # confirmed streak; subsequent contact glitches receive a grace window.
-        self.carry_confirmed_streak[:] = torch.where(
-            self.confirmed_carry_buf,
-            self.carry_confirmed_streak + 1,
-            torch.zeros_like(self.carry_confirmed_streak),
-        )
-        self.carry_acquired_buf |= (
-            self.carry_confirmed_streak >= self.carry_acquire_steps
-        )
-        lost_after_acquire = self.carry_acquired_buf & ~self.confirmed_carry_buf
-        self.carry_drop_streak[:] = torch.where(
-            lost_after_acquire,
-            self.carry_drop_streak + 1,
-            torch.zeros_like(self.carry_drop_streak),
-        )
-        self.carry_drop_failure_buf[:] = (
-            self.carry_acquired_buf
-            & (self.carry_drop_streak >= self.carry_drop_grace_steps)
-        )
-
-        inside_goal = (
-            self.object2goal_dist_xy < float(self.cfg.carry_navigation.goal_radius)
-        )
-        success_candidate = (
-            self.carry_acquired_buf & self.confirmed_carry_buf & inside_goal
-        )
-        self.carry_success_streak[:] = torch.where(
-            success_candidate,
-            self.carry_success_streak + 1,
-            torch.zeros_like(self.carry_success_streak),
-        )
-        self.carry_success_buf[:] = (
-            self.carry_success_streak >= self.carry_success_dwell_steps
-        ) & ~self.carry_drop_failure_buf
-
-        box_goal_dir = normalize(self.goal_pos[:, :2] - self.box_states[:, :2])
-        self.box_forward_velocity_buf[:] = torch.sum(
-            box_goal_dir * self.box_states[:, 7:9], dim=-1
-        )
+        # Long-range carry state machine (temporarily disabled):
+        # self.carry_confirmed_streak[:] = torch.where(
+        #     self.confirmed_carry_buf,
+        #     self.carry_confirmed_streak + 1,
+        #     torch.zeros_like(self.carry_confirmed_streak))
+        # self.carry_acquired_buf |= (
+        #     self.carry_confirmed_streak >= self.carry_acquire_steps)
+        # lost_after_acquire = self.carry_acquired_buf & ~self.confirmed_carry_buf
+        # self.carry_drop_streak[:] = torch.where(
+        #     lost_after_acquire,
+        #     self.carry_drop_streak + 1,
+        #     torch.zeros_like(self.carry_drop_streak))
+        # self.carry_drop_failure_buf[:] = (
+        #     self.carry_acquired_buf
+        #     & (self.carry_drop_streak >= self.carry_drop_grace_steps))
+        # inside_goal = (
+        #     self.object2goal_dist_xy < float(self.cfg.carry_navigation.goal_radius))
+        # success_candidate = (
+        #     self.carry_acquired_buf & self.confirmed_carry_buf & inside_goal)
+        # self.carry_success_streak[:] = torch.where(
+        #     success_candidate,
+        #     self.carry_success_streak + 1,
+        #     torch.zeros_like(self.carry_success_streak))
+        # self.carry_success_buf[:] = (
+        #     self.carry_success_streak >= self.carry_success_dwell_steps
+        # ) & ~self.carry_drop_failure_buf
+        # box_goal_dir = normalize(self.goal_pos[:, :2] - self.box_states[:, :2])
+        # self.box_forward_velocity_buf[:] = torch.sum(
+        #     box_goal_dir * self.box_states[:, 7:9], dim=-1)
 
         self.carry_phase_episode_sum += self.carry_phase_buf.float()
         self.confirmed_carry_episode_sum += self.confirmed_carry_buf.float()
         self.box_clearance_episode_sum += self.box_clearance_buf
         self.both_hand_contact_episode_sum += self.both_hand_contact_buf
-        acquired_float = self.carry_acquired_buf.float()
-        self.carry_acquired_episode_sum += acquired_float
-        self.post_acquire_episode_count += acquired_float
-        self.post_acquire_confirmed_episode_sum += (
-            self.carry_acquired_buf & self.confirmed_carry_buf
-        ).float()
-        self.box_goal_distance_episode_sum += self.object2goal_dist_xy
-        self.box_forward_velocity_episode_sum += (
-            self.box_forward_velocity_buf * acquired_float
-        )
+        # Long-range carry metric accumulation (temporarily disabled):
+        # acquired_float = self.carry_acquired_buf.float()
+        # self.carry_acquired_episode_sum += acquired_float
+        # self.post_acquire_episode_count += acquired_float
+        # self.post_acquire_confirmed_episode_sum += (
+        #     self.carry_acquired_buf & self.confirmed_carry_buf).float()
+        # self.box_goal_distance_episode_sum += self.object2goal_dist_xy
+        # self.box_forward_velocity_episode_sum += (
+        #     self.box_forward_velocity_buf * acquired_float)
 
         lifted, left_contact, right_contact, left_rel_speed, right_rel_speed = (
             self._get_hand_box_interaction_state()
@@ -1394,56 +1385,109 @@ class LeggedRobot(BaseTask):
         #     self.tar_platform_pos[curr_env_ids, 0:2] = torch.cat((goal_pos_x, goal_pos_y), dim=-1)
         #     self.tar_platform_pos[curr_env_ids, 2] = goal_pos_z.squeeze(1) - self._box_size[curr_env_ids, 2] / 2 - self._platform_height / 2
         #     self.goal_pos[curr_env_ids] = torch.cat((goal_pos_x, goal_pos_y, goal_pos_z), dim=-1)
-        self._sample_far_carry_goal(env_ids)
+        # Original placement-oriented target sampling restored for continued training.
+        for sk_name in ["putDown"]:
+            if (self._reset_ref_env_ids.get(sk_name) is None) or (len(self._reset_ref_env_ids[sk_name]) == 0):
+                continue
+            curr_env_ids = self._reset_ref_env_ids[sk_name]
+            goal_pos, goal_rot = self.motionlib.get_goal_motion_state(skill=sk_name, motion_ids=self._reset_ref_motion_ids[sk_name])
+            goal_pos[:, 2] = torch.clamp(torch.min(goal_pos[:, 2], self.box_states[curr_env_ids, 2]), min=self._box_size[curr_env_ids, 2] / 2 + self._platform_height)
 
-    def _sample_far_carry_goal(self, env_ids):
-        """Sample one 4--6 m XY navigation goal for every reset environment."""
-        if len(env_ids) == 0:
-            return
+            self.tar_platform_pos[curr_env_ids, 0:2] = goal_pos[:, 0:2]
+            self.tar_platform_pos[curr_env_ids, 2] = goal_pos[:, 2] - self._box_size[curr_env_ids, 2] / 2 - self._platform_height / 2
+            self.tar_platform_pos[curr_env_ids] += self.env_origins[curr_env_ids]
+            self.goal_pos[curr_env_ids] = goal_pos + self.env_origins[curr_env_ids]
+            self.goal_rot[curr_env_ids] = goal_rot
 
-        cfg = self.cfg.carry_navigation
-        min_distance, max_distance = cfg.goal_distance_range
-        min_bearing, max_bearing = cfg.goal_bearing_offset_deg
-        assert 0.0 < min_distance < max_distance
-        assert 0.0 <= min_bearing < max_bearing <= 180.0
+        for sk_name in ["carryWith"]:
+            if (self._reset_ref_env_ids.get(sk_name) is None) or (len(self._reset_ref_env_ids[sk_name]) == 0):
+                continue
+            curr_env_ids = self._reset_ref_env_ids[sk_name]
 
-        # Keep the legacy useful geometry: target roughly toward the robot side
-        # of the box, with a signed offset that requires controlled turning.
-        box_to_robot = (
-            self.root_states[env_ids, 0:2] - self.box_states[env_ids, 0:2]
-        )
-        base_angle = torch.atan2(box_to_robot[:, 1], box_to_robot[:, 0])
-        bearing_magnitude = torch_rand_float(
-            min_bearing, max_bearing, (len(env_ids), 1), device=self.device
-        ).squeeze(-1)
-        bearing_sign = torch.where(
-            torch.rand(len(env_ids), device=self.device) < 0.5,
-            -torch.ones(len(env_ids), device=self.device),
-            torch.ones(len(env_ids), device=self.device),
-        )
-        final_angle = base_angle + bearing_sign * bearing_magnitude * (torch.pi / 180.0)
-        distance = torch_rand_float(
-            min_distance, max_distance, (len(env_ids), 1), device=self.device
-        ).squeeze(-1)
+            mask = torch.randint(0, 2, (len(curr_env_ids), 2), device=self.device, dtype=torch.bool)
+            left = torch_rand_float(-4.0, -self.box_cfg.min_tar_dist, (len(curr_env_ids), 2), device=self.device)
+            right = torch_rand_float(self.box_cfg.min_tar_dist, 4.0, (len(curr_env_ids), 2), device=self.device)
+            goal_pos_xy = self.box_states[curr_env_ids, 0:2] + torch.where(mask, left, right)
+            goal_pos_z = torch.clamp(torch_rand_float(0.0, 0.4, (len(curr_env_ids), 1), device=self.device), min=(self._box_size[curr_env_ids, 2:3] / 2 + self._platform_height))
+            goal_pos = torch.cat((goal_pos_xy, goal_pos_z), dim=-1)
 
-        goal_xy = self.box_states[env_ids, 0:2] + distance.unsqueeze(-1) * torch.stack(
-            (torch.cos(final_angle), torch.sin(final_angle)), dim=-1
-        )
-        self.goal_pos[env_ids, 0:2] = goal_xy
-        self.goal_pos[env_ids, 2] = (
-            self.env_origins[env_ids, 2] + float(self.cfg.rewards.target_box_height)
-        )
+            axis = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).reshape(1, 3).expand([curr_env_ids.shape[0], -1])
+            ang = torch.rand((len(curr_env_ids),), device=self.device) * 2 * np.pi
+            goal_rot = quat_from_angle_axis(ang, axis)
 
-        axis = self.z_axis_unit.expand(len(env_ids), -1)
-        yaw = torch.rand(len(env_ids), device=self.device) * 2.0 * np.pi
-        self.goal_rot[env_ids] = quat_from_angle_axis(yaw, axis)
+            self.tar_platform_pos[curr_env_ids, 0:2] = goal_pos[:, 0:2]
+            self.tar_platform_pos[curr_env_ids, 2] = goal_pos[:, 2] - self._box_size[curr_env_ids, 2] / 2 - self._platform_height / 2
+            self.goal_pos[curr_env_ids] = goal_pos
+            self.goal_rot[curr_env_ids] = goal_rot
 
-        # Retain the blue platform as a ground-level visual goal marker. The
-        # reward and success condition use goal_pos XY only.
-        self.tar_platform_pos[env_ids, 0:2] = goal_xy
-        self.tar_platform_pos[env_ids, 2] = (
-            self.env_origins[env_ids, 2] + 0.5 * self._platform_height
-        )
+        random_env_ids = []
+        if len(self._reset_default_env_ids) > 0:
+            random_env_ids.append(self._reset_default_env_ids)
+        for sk_name in ["loco", "pickUp"]:
+            if self._reset_ref_env_ids.get(sk_name) is not None:
+                random_env_ids.append(self._reset_ref_env_ids[sk_name])
+
+        if len(random_env_ids) > 0:
+            curr_env_ids = torch.cat(random_env_ids, dim=0)
+
+            dir_to_robot = self.root_states[curr_env_ids, 0:2] - self.box_states[curr_env_ids, 0:2]
+            base_angle = torch.atan2(dir_to_robot[:, 1], dir_to_robot[:, 0]).unsqueeze(-1)
+            mask = torch.randint(0, 2, (len(curr_env_ids), 1), device=self.device, dtype=torch.bool)
+            left = torch_rand_float(-80., -10., (len(curr_env_ids), 1), device=self.device)
+            right = torch_rand_float(10., 80., (len(curr_env_ids), 1), device=self.device)
+            angle_offset = torch.where(mask, left, right) * (torch.pi / 180.0)
+            final_angle = base_angle + angle_offset
+            distance = torch_rand_float(0.6, 4.0, (len(curr_env_ids), 1), device=self.device)
+            goal_pos_x = self.box_states[curr_env_ids, 0:1] + distance * torch.cos(final_angle)
+            goal_pos_y = self.box_states[curr_env_ids, 1:2] + distance * torch.sin(final_angle)
+            goal_pos_z = torch.clamp(torch_rand_float(0.0, 0.4, (len(curr_env_ids), 1), device=self.device), min=(self._box_size[curr_env_ids, 2:3] / 2 + self._platform_height))
+
+            axis = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).reshape(1, 3).expand([curr_env_ids.shape[0], -1])
+            ang = torch.rand((len(curr_env_ids),), device=self.device) * 2 * np.pi
+            goal_rot = quat_from_angle_axis(ang, axis)
+
+            self.tar_platform_pos[curr_env_ids, 0:2] = torch.cat((goal_pos_x, goal_pos_y), dim=-1)
+            self.tar_platform_pos[curr_env_ids, 2] = goal_pos_z.squeeze(1) - self._box_size[curr_env_ids, 2] / 2 - self._platform_height / 2
+            self.goal_pos[curr_env_ids] = torch.cat((goal_pos_x, goal_pos_y, goal_pos_z), dim=-1)
+
+        # Long-range goal sampling (temporarily disabled):
+        # self._sample_far_carry_goal(env_ids)
+
+    # Long-range goal helper (temporarily disabled):
+    # def _sample_far_carry_goal(self, env_ids):
+    #     """Sample one 4--6 m XY navigation goal for every reset environment."""
+    #     if len(env_ids) == 0:
+    #         return
+    #     cfg = self.cfg.carry_navigation
+    #     min_distance, max_distance = cfg.goal_distance_range
+    #     min_bearing, max_bearing = cfg.goal_bearing_offset_deg
+    #     assert 0.0 < min_distance < max_distance
+    #     assert 0.0 <= min_bearing < max_bearing <= 180.0
+    #     box_to_robot = (
+    #         self.root_states[env_ids, 0:2] - self.box_states[env_ids, 0:2])
+    #     base_angle = torch.atan2(box_to_robot[:, 1], box_to_robot[:, 0])
+    #     bearing_magnitude = torch_rand_float(
+    #         min_bearing, max_bearing, (len(env_ids), 1), device=self.device
+    #     ).squeeze(-1)
+    #     bearing_sign = torch.where(
+    #         torch.rand(len(env_ids), device=self.device) < 0.5,
+    #         -torch.ones(len(env_ids), device=self.device),
+    #         torch.ones(len(env_ids), device=self.device))
+    #     final_angle = base_angle + bearing_sign * bearing_magnitude * (torch.pi / 180.0)
+    #     distance = torch_rand_float(
+    #         min_distance, max_distance, (len(env_ids), 1), device=self.device
+    #     ).squeeze(-1)
+    #     goal_xy = self.box_states[env_ids, 0:2] + distance.unsqueeze(-1) * torch.stack(
+    #         (torch.cos(final_angle), torch.sin(final_angle)), dim=-1)
+    #     self.goal_pos[env_ids, 0:2] = goal_xy
+    #     self.goal_pos[env_ids, 2] = (
+    #         self.env_origins[env_ids, 2] + float(self.cfg.rewards.target_box_height))
+    #     axis = self.z_axis_unit.expand(len(env_ids), -1)
+    #     yaw = torch.rand(len(env_ids), device=self.device) * 2.0 * np.pi
+    #     self.goal_rot[env_ids] = quat_from_angle_axis(yaw, axis)
+    #     self.tar_platform_pos[env_ids, 0:2] = goal_xy
+    #     self.tar_platform_pos[env_ids, 2] = (
+    #         self.env_origins[env_ids, 2] + 0.5 * self._platform_height)
     
     def _reset_env_tensors(self, env_ids):
         all_states = torch.cat((self.platform_states.unsqueeze(1), 
@@ -1594,35 +1638,28 @@ class LeggedRobot(BaseTask):
         self.confirmed_carry_buf = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
         )
-        self.carry_acquired_buf = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
-        self.carry_drop_failure_buf = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
-        self.carry_success_buf = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
-        self.carry_confirmed_streak = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self.device, requires_grad=False
-        )
-        self.carry_drop_streak = torch.zeros_like(self.carry_confirmed_streak)
-        self.carry_success_streak = torch.zeros_like(self.carry_confirmed_streak)
-        self.carry_acquire_steps = max(
-            1, int(np.ceil(float(self.cfg.carry_navigation.acquire_time_s) / self.dt))
-        )
-        self.carry_drop_grace_steps = max(
-            1, int(np.ceil(float(self.cfg.carry_navigation.drop_grace_time_s) / self.dt))
-        )
-        self.carry_success_dwell_steps = max(
-            1, int(np.ceil(float(self.cfg.carry_navigation.success_dwell_time_s) / self.dt))
-        )
+        # Long-range carry state buffers (temporarily disabled):
+        # self.carry_acquired_buf = torch.zeros(
+        #     self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        # self.carry_drop_failure_buf = torch.zeros(
+        #     self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        # self.carry_success_buf = torch.zeros(
+        #     self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        # self.carry_confirmed_streak = torch.zeros(
+        #     self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+        # self.carry_drop_streak = torch.zeros_like(self.carry_confirmed_streak)
+        # self.carry_success_streak = torch.zeros_like(self.carry_confirmed_streak)
+        # self.carry_acquire_steps = max(
+        #     1, int(np.ceil(float(self.cfg.carry_navigation.acquire_time_s) / self.dt)))
+        # self.carry_drop_grace_steps = max(
+        #     1, int(np.ceil(float(self.cfg.carry_navigation.drop_grace_time_s) / self.dt)))
+        # self.carry_success_dwell_steps = max(
+        #     1, int(np.ceil(float(self.cfg.carry_navigation.success_dwell_time_s) / self.dt)))
         self.box_clearance_buf = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
         )
-        self.box_forward_velocity_buf = torch.zeros(
-            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
-        )
+        # self.box_forward_velocity_buf = torch.zeros(
+        #     self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.both_hand_contact_buf = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
         )
@@ -1643,15 +1680,12 @@ class LeggedRobot(BaseTask):
             self.box_clearance_buf
         )
         self.lifted_episode_count = torch.zeros_like(self.box_clearance_buf)
-        self.carry_acquired_episode_sum = torch.zeros_like(self.box_clearance_buf)
-        self.post_acquire_confirmed_episode_sum = torch.zeros_like(
-            self.box_clearance_buf
-        )
-        self.post_acquire_episode_count = torch.zeros_like(self.box_clearance_buf)
-        self.box_goal_distance_episode_sum = torch.zeros_like(self.box_clearance_buf)
-        self.box_forward_velocity_episode_sum = torch.zeros_like(
-            self.box_clearance_buf
-        )
+        # Long-range carry metric buffers (temporarily disabled):
+        # self.carry_acquired_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        # self.post_acquire_confirmed_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        # self.post_acquire_episode_count = torch.zeros_like(self.box_clearance_buf)
+        # self.box_goal_distance_episode_sum = torch.zeros_like(self.box_clearance_buf)
+        # self.box_forward_velocity_episode_sum = torch.zeros_like(self.box_clearance_buf)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -2371,8 +2405,9 @@ class LeggedRobot(BaseTask):
     
     def _reward_termination(self):
         # Terminal reward / penalty
-        # A navigation success is an intentional terminal state, not a failure.
-        return self.reset_buf * ~self.time_out_buf * ~self.success_buf
+        return self.reset_buf * ~self.time_out_buf
+        # Long-range version excluded successful navigation terminals:
+        # return self.reset_buf * ~self.time_out_buf * ~self.success_buf
     
     def _reward_success_termination(self):
         # Terminal reward / penalty
@@ -2615,9 +2650,8 @@ class LeggedRobot(BaseTask):
         
         walk_reward[self.robot2object_dist < self.cfg.rewards.thresh_robot2object] = self.cfg.rewards.robot2object_pos + self.cfg.rewards.robot2object_vel + self.cfg.rewards.start_heading
         walk_reward[self.object2goal_dist_xyz < self.cfg.rewards.thresh_object2goal] = self.cfg.rewards.robot2object_pos + self.cfg.rewards.robot2object_vel + self.cfg.rewards.start_heading
-        # Once stable carry has been acquired, continuing to award approach
-        # behavior creates a profitable stationary local optimum.
-        walk_reward[self.carry_acquired_buf] = 0.0
+        # Long-range stage gating (temporarily disabled):
+        # walk_reward[self.carry_acquired_buf] = 0.0
 
         return walk_reward
     
@@ -2635,12 +2669,77 @@ class LeggedRobot(BaseTask):
         
         carryup_reward[self.robot2object_dist > self.cfg.rewards.thresh_robot2object] = 0.
         carryup_reward[self.object2goal_dist_xyz < self.cfg.rewards.thresh_object2goal] = self.cfg.rewards.hand_pos + self.cfg.rewards.box_height
-        # Carry height/contact quality is represented by carry_stability after
-        # acquisition; this term remains only for the pickup transition.
-        carryup_reward[self.carry_acquired_buf] = 0.0
+        # Long-range stage gating (temporarily disabled):
+        # carryup_reward[self.carry_acquired_buf] = 0.0
         return carryup_reward
 
-    # LEGACY REWARD IMPLEMENTATIONS (kept commented for traceability).
+    def _reward_relocation_task(self):
+        forward = quat_apply(self.base_quat, self.forward_vec)
+        heading = torch.atan2(forward[:, 1], forward[:, 0])
+        target_heading = torch.atan2(self.goal_pos[:, 1] - self.root_states[:, 1], self.goal_pos[:, 0] - self.root_states[:, 0])
+        yaw_error = torch.abs(wrap_to_pi(target_heading - heading))
+        relocation_heading_reward = torch.exp(-0.75 * yaw_error)
+
+        heading_error = 0.5 * wrap_to_pi(target_heading - heading)
+        ang_command = torch.clip(heading_error, -1., 1.)
+        ang_vel_error = torch.square(ang_command - self.base_ang_vel[:, 2])
+        relocation_heading_vel_reward = torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
+
+        robot2goal_pos_reward = torch.exp(-0.5 * self.robot2goal_dist)
+        global_lin_vel = self.rigid_body_states[:, self.upper_body_index, 7:10]
+        robot2goal_vel = torch.sum(normalize(self.robot2goal_dir) * global_lin_vel[:, :2], dim=-1)
+        robot2goal_vel_reward = torch.exp(-5 * torch.square(self.cfg.rewards.target_speed_carry - robot2goal_vel))
+        object2goal_pos_reward = torch.exp(-10.0 * self.object2goal_dist_xyz)
+
+        robot2goal_pos_reward[self.robot2goal_dist < self.cfg.rewards.thresh_robot2goal] = 1.
+        robot2goal_vel_reward[self.robot2goal_dist < self.cfg.rewards.thresh_robot2goal] = 1.
+
+        put_box_reward = torch.exp(-3.0 * torch.abs(self.box_states[:, 2] - self.goal_pos[:, 2]))
+        put_box_reward[self.object2goal_dist_xy > 0.6] = 0.0
+
+        relocation_reward = (self.cfg.rewards.relocation_heading * relocation_heading_reward +
+                             self.cfg.rewards.relocation_heading_vel * relocation_heading_vel_reward +
+                             self.cfg.rewards.robot2goal_pos * robot2goal_pos_reward +
+                             self.cfg.rewards.robot2goal_vel * robot2goal_vel_reward +
+                             self.cfg.rewards.object2goal_pos * object2goal_pos_reward +
+                             self.cfg.rewards.put_box * put_box_reward)
+
+        box_carryup_height = self.box_states[:, 2] - self._box_size[:, 2] / 2 - self.platform_pos[:, 2]
+        is_stage_relocation = ((box_carryup_height > 0.05) | (self.object2start_dist_xy > self.cfg.rewards.thresh_object2start))
+        relocation_reward[~is_stage_relocation] = 0.
+        relocation_reward[self.object2goal_dist_xyz < self.cfg.rewards.thresh_object2goal] = (self.cfg.rewards.relocation_heading +
+                                                                                              self.cfg.rewards.relocation_heading_vel +
+                                                                                              self.cfg.rewards.robot2goal_pos +
+                                                                                              self.cfg.rewards.robot2goal_vel +
+                                                                                              self.cfg.rewards.object2goal_pos +
+                                                                                              self.cfg.rewards.put_box)
+
+        return relocation_reward
+
+    def _reward_standup_task(self):
+        base_height = self.root_states[:, 2].clone()
+        base_height_reward = torch.exp(-2 * torch.abs(base_height - self.cfg.rewards.base_height_target))
+        base_height_reward[base_height > self.cfg.rewards.base_height_target] = 1.0
+
+        head_height = self.rigid_body_states[:, self.head_index, 2]
+        head_height_reward = torch.exp(-2 * torch.abs(head_height - self.cfg.rewards.head_height_target))
+        head_height_reward[head_height > self.cfg.rewards.head_height_target] = 1.0
+
+        stand_still_reward = torch.exp(-0.3 * torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1))
+
+        hand_contact = torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) > 1.0
+        hand_free_reward = torch.mean(1.0 * ~hand_contact, dim=1)
+
+        standup_reward = (self.cfg.rewards.base_height * base_height_reward +
+                        self.cfg.rewards.head_height * head_height_reward +
+                        self.cfg.rewards.stand_still * stand_still_reward +
+                        self.cfg.rewards.hand_free * hand_free_reward)
+
+        standup_reward[~self.success_buf] = 0.
+
+        return standup_reward
+
+    # LEGACY REWARD IMPLEMENTATIONS (duplicate commented copy kept for traceability).
     # They are disabled because relocation rewarded robot motion/placement and
     # standup only became active after a sparse place-and-release success.
     #
@@ -2695,72 +2794,55 @@ class LeggedRobot(BaseTask):
     #     standup_reward[~self.success_buf] = 0.
     #     return standup_reward
 
-    def _reward_carry_progress(self):
-        """Reward confirmed box motion toward the far navigation goal."""
-        target_speed = float(self.cfg.carry_navigation.target_carry_speed)
-        forward_velocity = self.box_forward_velocity_buf
-        velocity_progress = torch.clamp(
-            forward_velocity / max(target_speed, 1e-6), -1.0, 1.0
-        )
-        speed_tracking = torch.exp(
-            -5.0 * torch.square(target_speed - forward_velocity)
-        )
-
-        forward = quat_apply(self.base_quat, self.forward_vec)
-        heading = torch.atan2(forward[:, 1], forward[:, 0])
-        goal_heading = torch.atan2(
-            self.goal_pos[:, 1] - self.root_states[:, 1],
-            self.goal_pos[:, 0] - self.root_states[:, 0],
-        )
-        heading_reward = torch.exp(
-            -1.5 * torch.abs(wrap_to_pi(goal_heading - heading))
-        )
-
-        reward = (
-            self.cfg.rewards.carry_progress_velocity * velocity_progress
-            + self.cfg.rewards.carry_progress_speed_tracking * speed_tracking
-            + self.cfg.rewards.carry_progress_heading * heading_reward
-        )
-        active = self.carry_acquired_buf & self.confirmed_carry_buf
-        return torch.where(active, reward, torch.zeros_like(reward))
-
-    def _reward_carry_stability(self):
-        """Reward stable bimanual box retention after carry acquisition."""
-        _, left_contact, right_contact, left_rel_speed, right_rel_speed = (
-            self._get_hand_box_interaction_state()
-        )
-        contact_count = left_contact.float() + right_contact.float()
-        contact_reward = 0.5 * contact_count
-        mean_relative_speed = (
-            left_contact.float() * left_rel_speed
-            + right_contact.float() * right_rel_speed
-        ) / torch.clamp(contact_count, min=1.0)
-        relative_motion_reward = torch.exp(-4.0 * mean_relative_speed.square())
-        relative_motion_reward *= (contact_count > 0.0).float()
-
-        box_ang_vel_reward = torch.exp(
-            -0.5 * torch.sum(self.box_states[:, 10:13].square(), dim=-1)
-        )
-        box_upright_reward = torch.exp(
-            -4.0 * torch.sum(self.projected_gravity_box[:, 0:2].square(), dim=-1)
-        )
-        robot_upright_reward = torch.exp(
-            -4.0 * torch.sum(self.projected_gravity[:, 0:2].square(), dim=-1)
-        )
-        clearance_target = float(self.cfg.carry_phase.clearance_on)
-        height_deficit = torch.clamp(
-            clearance_target - self.box_clearance_buf, min=0.0
-        )
-        height_reward = torch.exp(-20.0 * height_deficit)
-
-        reward = (
-            self.cfg.rewards.carry_stability_contact * contact_reward
-            + self.cfg.rewards.carry_stability_relative_motion * relative_motion_reward
-            + self.cfg.rewards.carry_stability_box_angular_velocity * box_ang_vel_reward
-            + self.cfg.rewards.carry_stability_box_upright * box_upright_reward
-            + self.cfg.rewards.carry_stability_robot_upright * robot_upright_reward
-            + self.cfg.rewards.carry_stability_height * height_reward
-        )
-        return torch.where(
-            self.carry_acquired_buf, reward, torch.zeros_like(reward)
-        )
+    # Long-range rewards (temporarily disabled):
+    # def _reward_carry_progress(self):
+    #     target_speed = float(self.cfg.carry_navigation.target_carry_speed)
+    #     forward_velocity = self.box_forward_velocity_buf
+    #     velocity_progress = torch.clamp(
+    #         forward_velocity / max(target_speed, 1e-6), -1.0, 1.0)
+    #     speed_tracking = torch.exp(
+    #         -5.0 * torch.square(target_speed - forward_velocity))
+    #     forward = quat_apply(self.base_quat, self.forward_vec)
+    #     heading = torch.atan2(forward[:, 1], forward[:, 0])
+    #     goal_heading = torch.atan2(
+    #         self.goal_pos[:, 1] - self.root_states[:, 1],
+    #         self.goal_pos[:, 0] - self.root_states[:, 0])
+    #     heading_reward = torch.exp(
+    #         -1.5 * torch.abs(wrap_to_pi(goal_heading - heading)))
+    #     reward = (
+    #         self.cfg.rewards.carry_progress_velocity * velocity_progress
+    #         + self.cfg.rewards.carry_progress_speed_tracking * speed_tracking
+    #         + self.cfg.rewards.carry_progress_heading * heading_reward)
+    #     active = self.carry_acquired_buf & self.confirmed_carry_buf
+    #     return torch.where(active, reward, torch.zeros_like(reward))
+    #
+    # def _reward_carry_stability(self):
+    #     _, left_contact, right_contact, left_rel_speed, right_rel_speed = (
+    #         self._get_hand_box_interaction_state())
+    #     contact_count = left_contact.float() + right_contact.float()
+    #     contact_reward = 0.5 * contact_count
+    #     mean_relative_speed = (
+    #         left_contact.float() * left_rel_speed
+    #         + right_contact.float() * right_rel_speed
+    #     ) / torch.clamp(contact_count, min=1.0)
+    #     relative_motion_reward = torch.exp(-4.0 * mean_relative_speed.square())
+    #     relative_motion_reward *= (contact_count > 0.0).float()
+    #     box_ang_vel_reward = torch.exp(
+    #         -0.5 * torch.sum(self.box_states[:, 10:13].square(), dim=-1))
+    #     box_upright_reward = torch.exp(
+    #         -4.0 * torch.sum(self.projected_gravity_box[:, 0:2].square(), dim=-1))
+    #     robot_upright_reward = torch.exp(
+    #         -4.0 * torch.sum(self.projected_gravity[:, 0:2].square(), dim=-1))
+    #     clearance_target = float(self.cfg.carry_phase.clearance_on)
+    #     height_deficit = torch.clamp(
+    #         clearance_target - self.box_clearance_buf, min=0.0)
+    #     height_reward = torch.exp(-20.0 * height_deficit)
+    #     reward = (
+    #         self.cfg.rewards.carry_stability_contact * contact_reward
+    #         + self.cfg.rewards.carry_stability_relative_motion * relative_motion_reward
+    #         + self.cfg.rewards.carry_stability_box_angular_velocity * box_ang_vel_reward
+    #         + self.cfg.rewards.carry_stability_box_upright * box_upright_reward
+    #         + self.cfg.rewards.carry_stability_robot_upright * robot_upright_reward
+    #         + self.cfg.rewards.carry_stability_height * height_reward)
+    #     return torch.where(
+    #         self.carry_acquired_buf, reward, torch.zeros_like(reward))
