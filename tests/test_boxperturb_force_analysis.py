@@ -120,3 +120,13 @@ def test_six_direction_registry_and_observation_dimensions_are_unchanged():
     assert "num_actor_obs = 738" in config_source
     assert "num_privileged_obs = 143" in config_source
     assert "num_interaction_priv_obs = 17" in config_source
+
+
+def test_perturb_termination_does_not_require_disabled_long_range_buffers():
+    source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
+    check_block = source.split("    def check_termination(self):", 1)[1].split(
+        "    def reset_idx(self, env_ids):", 1
+    )[0]
+    assert "super().check_termination()" in check_block
+    assert "self.carry_success_buf" not in check_block
+    assert 'hasattr(self, "carry_drop_failure_buf")' in source

@@ -806,14 +806,11 @@ class LeggedRobot(CarryBox):
 
     def check_termination(self):
         """Keep evaluation trials alive on task success while retaining failures."""
-        if bool(self.cfg.box_perturbation.evaluation_ignore_task_success_reset):
-            saved_carry_success = self.carry_success_buf.clone()
-            self.carry_success_buf.zero_()
-            super().check_termination()
-            self.carry_success_buf[:] = saved_carry_success
-            self.success_buf[:] = saved_carry_success
-        else:
-            super().check_termination()
+        # The current CarryBox base computes success_buf for reporting but does
+        # not OR it into reset_buf.  Its older long-range carry_success_buf is
+        # intentionally disabled, so evaluation must not access that buffer.
+        # All physical failure and timeout termination conditions remain active.
+        super().check_termination()
 
     def reset_idx(self, env_ids):
         if len(env_ids) == 0:
@@ -824,7 +821,9 @@ class LeggedRobot(CarryBox):
                 env_id = int(env_id_tensor.item())
                 if int(self.episode_length_buf[env_id].item()) > 0:
                     reasons = []
-                    if bool(self.carry_drop_failure_buf[env_id].item()):
+                    if hasattr(self, "carry_drop_failure_buf") and bool(
+                        self.carry_drop_failure_buf[env_id].item()
+                    ):
                         reasons.append("drop")
                     if bool((self.projected_gravity_box[env_id, 2] > -0.05).item()):
                         reasons.append("box_tilt")
