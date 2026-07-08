@@ -19,7 +19,6 @@ from legged_gym.envs import *  # noqa: F401,F403
 from legged_gym.utils import task_registry
 from legged_gym.scripts.boxperturb_reporting import (
     FORCE_METRICS,
-    print_trial_terminal,
     summarize_force_trace,
     write_run_files,
 )
@@ -475,27 +474,59 @@ def _paired_comparison(trials, baseline_label, interaction_label):
     }
     metrics = (
         "recovery_success",
+        "recovery_time_s",
         "pulse_hold_retention",
+        "pulse_bimanual_contact_retention",
         "post_confirmed_ratio",
         "goal_progress_m",
         "hand_box_rel_speed_rms_mps",
+        "hand_box_rel_speed_peak_mps",
         "max_abs_roll_rad",
         "max_abs_pitch_rad",
+        "force_valid_fraction",
+        "pulse_force_valid_fraction",
+        "force_closure_residual_pulse_mean",
+        "left_rho_pulse_mean",
+        "right_rho_pulse_mean",
+        "normal_load_asymmetry_pulse_mean",
+        "pairwise_left_normal_mean_N",
+        "pairwise_right_normal_mean_N",
+    ) + tuple(
+        f"{key}_{suffix}"
+        for key in FORCE_METRICS
+        for suffix in ("pre_mean", "pulse_mean", "pulse_peak", "pulse_delta_from_pre")
     )
     result = {
         "positive_difference_means_interaction_minus_baseline": True,
         "higher_is_better": [
             "recovery_success",
             "pulse_hold_retention",
+            "pulse_bimanual_contact_retention",
             "post_confirmed_ratio",
             "goal_progress_m",
+            "force_valid_fraction",
+            "pulse_force_valid_fraction",
         ],
         "lower_is_better": [
+            "recovery_time_s",
             "hand_box_rel_speed_rms_mps",
+            "hand_box_rel_speed_peak_mps",
             "max_abs_roll_rad",
             "max_abs_pitch_rad",
+            "force_closure_residual_pulse_mean",
+            "normal_load_asymmetry_pulse_mean",
         ],
-        "notes": "Five seeds per cell are exploratory; no strong significance claim.",
+        "diagnostic_not_monotonic": [
+            "Fn/Ft raw and EMA responses",
+            "rho",
+            "pairwise normal load",
+        ],
+        "notes": (
+            "Every difference is interaction minus baseline for the same "
+            "direction, beta, and seed. Five seeds per cell are exploratory; "
+            "no strong significance claim. Force magnitudes are diagnostic and "
+            "are not automatically better when larger or smaller."
+        ),
         "cells": [],
     }
     cells = sorted(
@@ -561,7 +592,6 @@ def main(parsed):
                     )
                     trials.append(trial)
                     traces.extend(trace)
-                    print_trial_terminal(trial, prefix=f"AB:{label}")
 
     summary = _aggregate(trials)
     comparison = _paired_comparison(
@@ -594,6 +624,9 @@ def main(parsed):
         encoding="utf-8",
     ) as handle:
         json.dump(comparison, handle, indent=2, ensure_ascii=False, allow_nan=True)
+    _write_csv(
+        os.path.join(parsed.output_dir, "comparison.csv"), comparison["cells"]
+    )
     print(
         f"[ABComplete] trials={len(trials)} trace_rows={len(traces)} "
         f"output_dir={os.path.abspath(parsed.output_dir)}"
