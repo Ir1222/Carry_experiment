@@ -11,7 +11,6 @@ import torch
 
 from legged_gym.scripts.boxperturb_reporting import (
     aggregate_trials,
-    print_trial_terminal,
     summarize_force_trace,
     write_run_files,
 )
@@ -216,7 +215,6 @@ def run_boxperturb_visual_sweep(env, policy, args):
             }
             trials.append(trial)
             traces.extend(trace)
-            print_trial_terminal(trial, prefix="Sweep")
             continue
 
         peak = env.schedule_explicit_box_perturbation(direction, beta, env_id=0)
@@ -284,7 +282,6 @@ def run_boxperturb_visual_sweep(env, policy, args):
         }
         trials.append(trial)
         traces.extend(trace)
-        print_trial_terminal(trial, prefix="Sweep")
 
     metadata = {
         "mode": "play", "checkpoint": args.resume_path, "seed": seed,

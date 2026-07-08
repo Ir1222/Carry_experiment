@@ -226,6 +226,10 @@ class LeggedRobot(CarryBox):
 
     def _log_applied_force_debug(self):
         cfg = self.cfg.box_perturbation
+        # Evaluation traces are persisted to CSV.  Avoid flooding the terminal
+        # with policy-step force details during an explicit sweep.
+        if bool(cfg.evaluation_mode):
+            return
         interval = int(cfg.debug_force_log_interval_policy_steps)
         if not bool(cfg.debug_draw_force) or interval <= 0:
             return
@@ -362,6 +366,13 @@ class LeggedRobot(CarryBox):
             beta_tensor,
             direction_ids,
             f"evaluation:{direction_name}",
+        )
+        world = self.box_perturb_direction_world[env_id].detach().cpu().tolist()
+        print(
+            "[BoxPerturb] "
+            f"direction={direction_name} "
+            f"world_direction=({world[0]:+.4f},{world[1]:+.4f},{world[2]:+.4f}) "
+            f"peak={float(self.box_perturb_peak_force_N[env_id].item()):.4f}N"
         )
         return float(self.box_perturb_peak_force_N[env_id].item())
 
@@ -599,18 +610,6 @@ class LeggedRobot(CarryBox):
             row[f"{key}_pre_baseline"] = baseline
             row[f"{key}_delta_from_pre"] = float("nan") if self._trace_force_baseline is None else row[key] - baseline
         self.box_perturb_force_trace.append(row)
-        if self.box_perturb_trace_verbose:
-            print(
-                "[ForceTrace] "
-                f"phase={row['phase']} k={row['elapsed_pulse_physics_steps']:02d} "
-                f"Fext={row['f_ext_norm_N']:.4f}N "
-                f"L(Fn/Ft)={row['left_fn_raw_N']:.4f}/{row['left_ft_raw_N']:.4f}N "
-                f"R(Fn/Ft)={row['right_fn_raw_N']:.4f}/{row['right_ft_raw_N']:.4f}N "
-                f"EMA_L={row['left_fn_ema_N']:.4f}/{row['left_ft_ema_N']:.4f}N "
-                f"EMA_R={row['right_fn_ema_N']:.4f}/{row['right_ft_ema_N']:.4f}N "
-                f"rho={row['left_rho_raw']:.3f}/{row['right_rho_raw']:.3f} "
-                f"closure={row['force_closure_residual']:.3f} valid={row['force_decomposition_valid']}"
-            )
 
     def _schedule_box_perturbation(self, env_ids):
         cfg = self.cfg.box_perturbation
@@ -1020,26 +1019,3 @@ class LeggedRobot(CarryBox):
                 vertices,
                 colors,
             )
-
-            hand_scale = scale
-            for hand_index, hand_color in (
-                (int(self.left_hand_net_contact_force_index), [0.0, 1.0, 1.0]),
-                (int(self.right_hand_net_contact_force_index), [1.0, 0.0, 1.0]),
-            ):
-                hand_force = (
-                    -self.contact_forces[env_id, hand_index]
-                ).detach().cpu().numpy()
-                hand_start = self.rigid_body_states[
-                    env_id, hand_index, :3
-                ].detach().cpu().numpy()
-                hand_end = hand_start + hand_force * hand_scale
-                hand_vertices = np.concatenate((hand_start, hand_end)).astype(
-                    np.float32
-                ).reshape(1, 6)
-                self.gym.add_lines(
-                    self.viewer,
-                    self.envs[env_id],
-                    1,
-                    hand_vertices,
-                    np.asarray(hand_color, dtype=np.float32).reshape(1, 3),
-                )
