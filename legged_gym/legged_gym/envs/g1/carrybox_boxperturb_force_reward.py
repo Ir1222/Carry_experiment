@@ -7,6 +7,11 @@ from isaacgym import gymapi, gymtorch
 from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 
 from .carrybox import LeggedRobot as CarryBox
+from .hand_box_force import (
+    decompose_force,
+    estimate_box_face_normal_local,
+    force_closure_residual,
+)
 
 
 class LeggedRobot(CarryBox):
@@ -103,13 +108,10 @@ class LeggedRobot(CarryBox):
         relative_world = hand_pos - self.box_states[:, None, 0:3]
         box_quat = self.box_states[:, None, 3:7].expand(-1, 2, -1).reshape(-1, 4)
         relative_local = quat_rotate_inverse(box_quat, relative_world.reshape(-1, 3)).reshape(-1, 2, 3)
-        normalized_distance = relative_local.abs() / (0.5 * self._box_size[:, None, :] + float(self.cfg.force_reward.eps))
-        face_axis = normalized_distance.argmax(dim=-1)
-        face_coord = relative_local.gather(2, face_axis.unsqueeze(-1)).squeeze(-1)
-        face_sign = torch.where(face_coord >= 0.0, 1.0, -1.0)
-        normal_local = torch.zeros_like(relative_local)
-        normal_local.scatter_(2, face_axis.unsqueeze(-1), face_sign.unsqueeze(-1))
-        self.force_face_id_buf[new_lock] = (2 * face_axis + (face_sign > 0).long())[new_lock]
+        normal_local, face_id = estimate_box_face_normal_local(
+            relative_local, self._box_size[:, None, :], self.cfg.force_reward.eps
+        )
+        self.force_face_id_buf[new_lock] = face_id[new_lock]
         self.force_normal_local_buf[new_lock] = normal_local[new_lock]
         self.force_face_locked_buf[new_lock] = True
 
@@ -144,12 +146,9 @@ class LeggedRobot(CarryBox):
 
         n_world = n_world * self.force_normal_sign_buf.unsqueeze(-1)
         self.force_normal_world_buf[:] = n_world
-        fn_signed = torch.sum(raw * n_world, dim=-1)
-        fn = torch.relu(fn_signed)
-        tangential = raw - fn.unsqueeze(-1) * n_world
-        ft = torch.linalg.vector_norm(tangential, dim=-1)
+        fn_signed, fn, fn_vector, tangential, ft = decompose_force(raw, n_world)
         self.force_fn_signed_buf[:] = fn_signed
-        self.force_normal_component_world_buf[:] = fn.unsqueeze(-1) * n_world
+        self.force_normal_component_world_buf[:] = fn_vector
         self.force_tangential_world_buf[:] = tangential
 
         positive = self.confirmed_carry_buf.unsqueeze(1) & (fn_signed > 0.0)
@@ -198,9 +197,7 @@ class LeggedRobot(CarryBox):
         )
 
         box_force = self.contact_forces[:, self.box_net_contact_force_index, :]
-        closure_num = torch.linalg.vector_norm(raw.sum(dim=1) + box_force, dim=-1)
-        closure_den = torch.linalg.vector_norm(raw, dim=-1).sum(dim=1) + torch.linalg.vector_norm(box_force, dim=-1) + eps
-        self.force_closure_residual_buf[:] = closure_num / closure_den
+        self.force_closure_residual_buf[:] = force_closure_residual(raw, box_force, eps)
 
         confirmed_gate = self.confirmed_carry_buf & self.force_reward_valid_buf
         event_gate = confirmed_gate & (self.box_perturb_active_buf | self.perturb_recovery_window_buf)

@@ -1,0 +1,122 @@
+import importlib.util
+import json
+import math
+from pathlib import Path
+
+import torch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load(name, relative_path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+force = _load(
+    "hand_box_force",
+    "legged_gym/legged_gym/envs/g1/hand_box_force.py",
+)
+reporting = _load(
+    "boxperturb_reporting",
+    "legged_gym/legged_gym/scripts/boxperturb_reporting.py",
+)
+
+
+def test_force_decomposition_pure_normal_tangent_and_mixed():
+    normal = torch.tensor([[1.0, 0.0, 0.0]]).expand(3, -1)
+    raw = torch.tensor([[4.0, 0.0, 0.0], [0.0, 3.0, 0.0], [4.0, 3.0, 0.0]])
+    signed, fn, _, tangent, ft = force.decompose_force(raw, normal)
+    assert torch.allclose(signed, torch.tensor([4.0, 0.0, 4.0]))
+    assert torch.allclose(fn, torch.tensor([4.0, 0.0, 4.0]))
+    assert torch.allclose(ft, torch.tensor([0.0, 3.0, 3.0]))
+    assert torch.allclose(tangent[2], torch.tensor([0.0, 3.0, 0.0]))
+
+
+def test_force_decomposition_rotated_normal_and_compression_clamp():
+    inv_sqrt_2 = 2.0 ** -0.5
+    normal = torch.tensor([[inv_sqrt_2, inv_sqrt_2, 0.0], [1.0, 0.0, 0.0]])
+    raw = torch.tensor([[2.0 * inv_sqrt_2, 2.0 * inv_sqrt_2, 5.0], [-3.0, 4.0, 0.0]])
+    signed, fn, _, _, ft = force.decompose_force(raw, normal)
+    assert torch.allclose(signed, torch.tensor([2.0, -3.0]), atol=1e-6)
+    assert torch.allclose(fn, torch.tensor([2.0, 0.0]), atol=1e-6)
+    assert torch.allclose(ft, torch.tensor([5.0, 5.0]), atol=1e-6)
+
+
+def test_face_estimation_and_closure():
+    relative = torch.tensor([[0.51, 0.1, 0.1], [0.1, -1.01, 0.1]])
+    size = torch.tensor([[1.0, 2.0, 2.0], [1.0, 2.0, 2.0]])
+    normal, face_id = force.estimate_box_face_normal_local(relative, size)
+    assert torch.equal(normal, torch.tensor([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]))
+    assert torch.equal(face_id, torch.tensor([1, 2]))
+    hands = torch.tensor([[[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]]])
+    box = torch.tensor([[-5.0, 0.0, 0.0]])
+    assert torch.allclose(force.force_closure_residual(hands, box), torch.zeros(1), atol=1e-6)
+
+
+def _trace_row(phase, value, valid=1, impulse=0.0):
+    row = {
+        "phase": phase, "force_decomposition_valid": valid,
+        "force_closure_residual": 0.1, "left_rho_raw": 0.2,
+        "right_rho_raw": 0.3, "normal_load_asymmetry": 0.1,
+        "force_impulse_Ns": impulse, "force_uncapped_peak_N": 12.0,
+        "force_peak_N": 10.0, "force_cap_used": 1,
+        "perturb_direction_world_x": 1.0, "perturb_direction_world_y": 0.0,
+        "perturb_direction_world_z": 0.0,
+    }
+    for key in reporting.FORCE_METRICS:
+        row[key] = value
+    return row
+
+
+def test_trace_summary_baseline_delta_validity_and_outputs(tmp_path):
+    trace = [_trace_row("pre", 2.0) for _ in range(40)]
+    trace += [_trace_row("pulse", 5.0, valid=index % 2, impulse=0.01 * index) for index in range(4)]
+    trace += [_trace_row("recovery", 3.0) for _ in range(2)]
+    summary = reporting.summarize_force_trace(trace)
+    assert summary["left_fn_raw_N_pre_mean"] == 2.0
+    assert summary["left_fn_raw_N_pulse_mean"] == 5.0
+    assert summary["left_fn_raw_N_pulse_delta_from_pre"] == 3.0
+    assert summary["pulse_force_valid_fraction"] == 0.5
+    assert summary["force_baseline_unavailable"] == 0
+    trial = {
+        "model": "m", "direction": "+box_x", "requested_beta": 0.25,
+        "precondition_success": 1, "recovery_success": 1,
+        "pulse_hold_retention": 1.0, "post_confirmed_ratio": 1.0,
+        **summary,
+    }
+    reporting.write_run_files(str(tmp_path), [trial], trace, {"physics_dt_s": 0.005})
+    for name in ("force_trace.csv", "trials.csv", "summary.csv", "run_metadata.json"):
+        assert (tmp_path / name).is_file()
+    assert json.loads((tmp_path / "run_metadata.json").read_text())["physics_dt_s"] == 0.005
+
+
+def test_half_sine_midpoint_peak_cap_and_impulse():
+    dt, duration, mass, beta, cap = 0.005, 0.1, 4.0, 0.75, 10.0
+    steps = round(duration / dt)
+    uncapped = beta * mass * 9.81
+    peak = min(uncapped, cap)
+    samples = [peak * math.sin(math.pi * (k + 0.5) / steps) for k in range(steps)]
+    expected_impulse = 2.0 * peak * duration / math.pi
+    assert uncapped > cap and peak == cap
+    assert abs(sum(samples) * dt - expected_impulse) < 0.002
+
+
+def test_six_direction_registry_and_observation_dimensions_are_unchanged():
+    perturb_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
+    config_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb_resume_config.py").read_text()
+    expected_order = (
+        '"+box_x"', '"-box_x"', '"+box_y"', '"-box_y"',
+        '"+z_world"', '"-z_world"',
+    )
+    debug_block = config_source.split("debug_sweep_directions = (", 1)[1].split(")", 1)[0]
+    assert all(token in perturb_source for token in expected_order)
+    assert [debug_block.index(token) for token in expected_order] == sorted(
+        debug_block.index(token) for token in expected_order
+    )
+    assert "num_actor_obs = 738" in config_source
+    assert "num_privileged_obs = 143" in config_source
+    assert "num_interaction_priv_obs = 17" in config_source

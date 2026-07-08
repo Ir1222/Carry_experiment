@@ -28,6 +28,8 @@ class G1Cfg(CarryBoxResumeCfg):
         max_events_per_episode = 1
         pulse_duration_s = 0.10
         force_peak_cap_N = 10.0
+        force_sign_verification_samples = 12
+        force_closure_residual_max = 0.20
 
         schedule_mode = "staged_policy_steps"
         manual_stage_override = None
@@ -81,7 +83,7 @@ class G1Cfg(CarryBoxResumeCfg):
         debug_force_log_interval_policy_steps = 1
 
         # Evaluation-only deterministic sweep. For every beta level, test all
-        # five directions once before increasing the force level.
+        # six evaluation directions once before increasing the force level.
         debug_sweep_enabled = False
         debug_sweep_beta_values = (0.10, 0.25, 0.50, 0.75)
         debug_sweep_directions = (
@@ -89,6 +91,7 @@ class G1Cfg(CarryBoxResumeCfg):
             "-box_x",
             "+box_y",
             "-box_y",
+            "+z_world",
             "-z_world",
         )
         debug_sweep_inter_event_policy_steps = 75

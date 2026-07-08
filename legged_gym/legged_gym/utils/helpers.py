@@ -208,6 +208,9 @@ def get_args():
         {"name": "--debug_force_event", "action": "store_true", "default": False, "help": "Force the gated box perturbation event to trigger during play/evaluation."},
         {"name": "--debug_force_sweep", "action": "store_true", "default": False, "help": "Run a deterministic one-robot increasing-force sweep over every box direction."},
         {"name": "--verbose_force_trace", "action": "store_true", "default": False, "help": "Print every physics-substep external and hand-force sample during perturbation evaluation."},
+        {"name": "--force_sweep_directions", "type": str, "default": None, "help": "Comma-separated explicit sweep directions."},
+        {"name": "--force_sweep_betas", "type": str, "default": None, "help": "Comma-separated explicit sweep beta values."},
+        {"name": "--boxperturb_output_dir", "type": str, "default": None, "help": "Directory for perturbation CSV and metadata outputs."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

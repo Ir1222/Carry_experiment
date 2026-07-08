@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
 import isaacgym  # noqa: F401
@@ -7,6 +8,13 @@ from legged_gym.utils import get_args, export_policy_as_jit, export_jit_to_onnx,
 
 import numpy as np
 import torch
+
+from legged_gym.scripts.boxperturb_reporting import (
+    aggregate_trials,
+    print_trial_terminal,
+    summarize_force_trace,
+    write_run_files,
+)
 
 
 def load_actor_only_for_inference(ppo_runner, checkpoint_path, device):
@@ -146,8 +154,20 @@ def _disable_boxperturb_eval_randomization(env_cfg):
 
 def run_boxperturb_visual_sweep(env, policy, args):
     cfg = env.cfg.box_perturbation
-    betas = tuple(cfg.debug_sweep_beta_values)
-    directions = tuple(cfg.debug_sweep_directions)
+    betas = (
+        tuple(float(value.strip()) for value in args.force_sweep_betas.split(",") if value.strip())
+        if args.force_sweep_betas else tuple(cfg.debug_sweep_beta_values)
+    )
+    directions = (
+        tuple(value.strip() for value in args.force_sweep_directions.split(",") if value.strip())
+        if args.force_sweep_directions else tuple(cfg.debug_sweep_directions)
+    )
+    unknown = [name for name in directions if name not in env._DIRECTION_IDS]
+    if unknown:
+        raise ValueError(f"Unknown force sweep directions: {unknown}")
+    output_dir = args.boxperturb_output_dir or os.path.join(
+        LEGGED_GYM_ROOT_DIR, "logs", "boxperturb_play", datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
     seed = 1 if args.seed is None else int(args.seed)
     precondition_steps = int(
         round(float(cfg.evaluation_precondition_timeout_s) / env.dt)
@@ -155,6 +175,8 @@ def run_boxperturb_visual_sweep(env, policy, args):
     recovery_steps = env._recovery_policy_steps()
     post_steps = int(round(float(cfg.evaluation_post_window_s) / env.dt))
     total = len(betas) * len(directions)
+    trials = []
+    traces = []
 
     test_cells = [(beta, direction) for beta in betas for direction in directions]
     for test_index, (beta, direction) in enumerate(test_cells, start=1):
@@ -185,11 +207,16 @@ def run_boxperturb_visual_sweep(env, policy, args):
 
         if not precondition_ok:
             trace = env.end_box_perturb_trace()
-            print(
-                f"[SweepResult] test={test_index}/{total} seed={seed} "
-                f"direction={direction} beta={float(beta):.2f} "
-                f"status=precondition_failed trace_rows={len(trace)}"
-            )
+            trial = {
+                "model": "play", "seed": seed, "direction": direction,
+                "requested_beta": float(beta), "precondition_success": 0,
+                "event_triggered": 0, "peak_force_N": float("nan"),
+                "recovery_success": float("nan"), "termination_reason": env.box_perturb_last_termination_reason[0],
+                "trace_rows": len(trace), **summarize_force_trace(trace),
+            }
+            trials.append(trial)
+            traces.extend(trace)
+            print_trial_terminal(trial, prefix="Sweep")
             continue
 
         peak = env.schedule_explicit_box_perturbation(direction, beta, env_id=0)
@@ -242,14 +269,42 @@ def run_boxperturb_visual_sweep(env, policy, args):
         recovery_time_s = (
             recovery_time_steps * env.dt if recovery_time_steps >= 0 else float("nan")
         )
-        print(
-            f"[SweepResult] test={test_index}/{total} seed={seed} "
-            f"direction={direction} beta={float(beta):.2f} peak={peak:.3f}N "
-            f"pulse_hold={pulse_hold:.3f} recovery={int(recovery_success)} "
-            f"recovery_time_s={recovery_time_s:.3f} post_confirmed={post_ratio:.3f} "
-            f"goal_progress_m={goal_start - goal_end:.3f} "
-            f"termination={termination_reason or 'none'} trace_rows={len(trace)}"
-        )
+        trial = {
+            "model": "play", "seed": seed, "direction": direction,
+            "requested_beta": float(beta), "precondition_success": 1,
+            "event_triggered": 1, "peak_force_N": peak,
+            "pulse_hold_retention": pulse_hold,
+            "recovery_success": int(recovery_success),
+            "recovery_time_s": recovery_time_s,
+            "post_confirmed_ratio": post_ratio,
+            "goal_progress_m": goal_start - goal_end,
+            "termination": int(bool(termination_reason)),
+            "termination_reason": termination_reason,
+            "trace_rows": len(trace), **summarize_force_trace(trace),
+        }
+        trials.append(trial)
+        traces.extend(trace)
+        print_trial_terminal(trial, prefix="Sweep")
+
+    metadata = {
+        "mode": "play", "checkpoint": args.resume_path, "seed": seed,
+        "coordinate_convention": {
+            "box_xy": "box-local axes rotated to world at schedule time",
+            "world_z": "gravity-aligned world axis",
+            "force": "world-frame N", "impulse": "N s",
+        },
+        "physics_dt_s": float(env.sim_params.dt), "policy_dt_s": float(env.dt),
+        "pulse_profile": "midpoint-sampled half-sine",
+        "pulse_duration_s": float(cfg.pulse_duration_s),
+        "force_peak_cap_N": cfg.force_peak_cap_N,
+        "directions": list(directions), "betas": list(betas),
+        "force_decomposition": "hand rigid-body net contact force projected on estimated locked box-face normal",
+        "ema_tau_s": 0.04, "baseline_valid_physics_substeps": 40,
+        "force_sign_verification_samples": int(cfg.force_sign_verification_samples),
+        "force_closure_residual_max": float(cfg.force_closure_residual_max),
+    }
+    write_run_files(output_dir, trials, traces, metadata, aggregate_trials(trials))
+    print(f"[SweepComplete] trials={len(trials)} trace_rows={len(traces)} output_dir={os.path.abspath(output_dir)}")
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing

@@ -17,10 +17,16 @@ import torch
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import *  # noqa: F401,F403
 from legged_gym.utils import task_registry
+from legged_gym.scripts.boxperturb_reporting import (
+    FORCE_METRICS,
+    print_trial_terminal,
+    summarize_force_trace,
+    write_run_files,
+)
 
 
 TASK = "carrybox_boxperturb_resume"
-DEFAULT_DIRECTIONS = ("+box_x", "-box_x", "+box_y", "-box_y", "-z_world")
+DEFAULT_DIRECTIONS = ("+box_x", "-box_x", "+box_y", "-box_y", "+z_world", "-z_world")
 DEFAULT_BETAS = (0.10, 0.25, 0.50, 0.75)
 
 
@@ -243,6 +249,7 @@ def _run_trial(env, policy, model_label, checkpoint_path, seed, direction, beta,
             ),
         )
         base_summary["trace_rows"] = len(trace)
+        base_summary.update(summarize_force_trace(trace))
         return base_summary, trace
 
     goal_start = float(env.object2goal_dist_xy[0].item())
@@ -377,6 +384,7 @@ def _run_trial(env, policy, model_label, checkpoint_path, seed, direction, beta,
         recovery_trace_rows=len(recovery_rows),
         post_trace_rows=len(post_rows),
     )
+    base_summary.update(summarize_force_trace(trace))
     return base_summary, trace
 
 
@@ -414,6 +422,15 @@ def _aggregate(trials):
         "right_hand_pulse_mean_N",
         "resistive_hand_force_mean_N",
         "hand_load_asymmetry_mean",
+        "force_valid_fraction",
+        "force_closure_residual_pulse_mean",
+        "left_rho_pulse_mean",
+        "right_rho_pulse_mean",
+        "normal_load_asymmetry_pulse_mean",
+    ) + tuple(
+        f"{key}_{suffix}"
+        for key in FORCE_METRICS
+        for suffix in ("pre_mean", "pulse_mean", "pulse_peak", "pulse_delta_from_pre")
     )
     summary = []
     for (model, direction, beta), rows in sorted(groups.items()):
@@ -544,20 +561,33 @@ def main(parsed):
                     )
                     trials.append(trial)
                     traces.extend(trace)
-                    print(
-                        "[ABTrial] "
-                        f"model={label} seed={seed} direction={direction} beta={beta:.2f} "
-                        f"pre={trial['precondition_success']} event={trial['event_triggered']} "
-                        f"recovery={trial['recovery_success']} termination={trial['termination_reason'] or 'none'}"
-                    )
+                    print_trial_terminal(trial, prefix=f"AB:{label}")
 
     summary = _aggregate(trials)
     comparison = _paired_comparison(
         trials, parsed.baseline_label, parsed.interaction_label
     )
-    _write_csv(os.path.join(parsed.output_dir, "trials.csv"), trials)
-    _write_csv(os.path.join(parsed.output_dir, "force_trace.csv"), traces)
-    _write_csv(os.path.join(parsed.output_dir, "summary.csv"), summary)
+    metadata = {
+        "mode": "batch_ab", "checkpoints": {
+            parsed.baseline_label: parsed.baseline_checkpoint,
+            parsed.interaction_label: parsed.interaction_checkpoint,
+        },
+        "seeds": list(parsed.seeds), "directions": list(parsed.directions),
+        "betas": list(parsed.betas),
+        "coordinate_convention": {
+            "box_xy": "box-local axes rotated to world at schedule time",
+            "world_z": "gravity-aligned world axis", "force": "world-frame N", "impulse": "N s",
+        },
+        "physics_dt_s": float(env.sim_params.dt), "policy_dt_s": float(env.dt),
+        "pulse_profile": "midpoint-sampled half-sine",
+        "pulse_duration_s": float(env.cfg.box_perturbation.pulse_duration_s),
+        "force_peak_cap_N": env.cfg.box_perturbation.force_peak_cap_N,
+        "force_decomposition": "hand rigid-body net contact force projected on estimated locked box-face normal",
+        "ema_tau_s": 0.04, "baseline_valid_physics_substeps": 40,
+        "force_sign_verification_samples": int(env.cfg.box_perturbation.force_sign_verification_samples),
+        "force_closure_residual_max": float(env.cfg.box_perturbation.force_closure_residual_max),
+    }
+    write_run_files(parsed.output_dir, trials, traces, metadata, summary)
     with open(
         os.path.join(parsed.output_dir, "comparison.json"),
         "w",

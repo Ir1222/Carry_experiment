@@ -4,9 +4,14 @@ import numpy as np
 import torch
 
 from isaacgym import gymapi, gymtorch
-from isaacgym.torch_utils import quat_rotate
+from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 
 from .carrybox import LeggedRobot as CarryBox
+from .hand_box_force import (
+    decompose_force,
+    estimate_box_face_normal_local,
+    force_closure_residual,
+)
 
 
 class LeggedRobot(CarryBox):
@@ -18,6 +23,7 @@ class LeggedRobot(CarryBox):
         "+box_y": 2,
         "-box_y": 3,
         "-z_world": 4,
+        "+z_world": 5,
     }
 
     def _init_buffers(self):
@@ -57,6 +63,7 @@ class LeggedRobot(CarryBox):
         self.box_perturb_trace_phase = "idle"
         self.box_perturb_trace_metadata = {}
         self.box_perturb_last_termination_reason = [""] * n
+        self._reset_force_trace_analysis()
 
         # Run-level counters provide stable rollout metrics even when no episode ends.
         self._perturb_total_decisions = torch.zeros((), device=device)
@@ -265,6 +272,40 @@ class LeggedRobot(CarryBox):
         self.box_perturb_trace_phase = "pre"
         self.box_perturb_trace_enabled = True
         self.box_perturb_last_termination_reason[0] = ""
+        self._reset_force_trace_analysis()
+
+    def _reset_force_trace_analysis(self):
+        """Reset one-env, evaluation-only force analysis state."""
+        self._trace_face_locked = torch.zeros((2,), dtype=torch.bool, device=self.device)
+        self._trace_face_id = torch.full((2,), -1, dtype=torch.long, device=self.device)
+        self._trace_normal_local = torch.zeros((2, 3), device=self.device)
+        self._trace_normal_sign = torch.ones((2,), device=self.device)
+        self._trace_sign_sum = torch.zeros((2,), device=self.device)
+        self._trace_sign_count = torch.zeros((2,), dtype=torch.long, device=self.device)
+        self._trace_sign_verified = torch.zeros((2,), dtype=torch.bool, device=self.device)
+        self._trace_fn_ema = torch.zeros((2,), device=self.device)
+        self._trace_ft_ema = torch.zeros((2,), device=self.device)
+        self._trace_ema_initialized = torch.zeros((2,), dtype=torch.bool, device=self.device)
+        self._trace_force_baseline = None
+        self._trace_force_baseline_count = 0
+        self._trace_impulse_Ns = 0.0
+
+    def _freeze_force_trace_baseline(self):
+        keys = (
+            "left_fn_raw_N", "right_fn_raw_N", "left_ft_raw_N", "right_ft_raw_N",
+            "left_fn_ema_N", "right_fn_ema_N", "left_ft_ema_N", "right_ft_ema_N",
+        )
+        valid = [
+            row for row in self.box_perturb_force_trace
+            if row.get("phase") == "pre" and row.get("force_decomposition_valid") == 1
+        ][-40:]
+        self._trace_force_baseline_count = len(valid)
+        if len(valid) < 40:
+            self._trace_force_baseline = None
+            return
+        self._trace_force_baseline = {
+            key: float(sum(float(row[key]) for row in valid) / len(valid)) for key in keys
+        }
 
     def set_box_perturb_trace_phase(self, phase):
         self.box_perturb_trace_phase = str(phase)
@@ -298,8 +339,8 @@ class LeggedRobot(CarryBox):
 
         env_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
         direction_world = torch.zeros((1, 3), device=self.device)
-        if direction_name == "-z_world":
-            direction_world[0, 2] = -1.0
+        if direction_name.endswith("z_world"):
+            direction_world[0, 2] = 1.0 if direction_name[0] == "+" else -1.0
         else:
             local_axis = torch.zeros((1, 3), device=self.device)
             component = 0 if direction_name[-1] == "x" else 1
@@ -313,6 +354,7 @@ class LeggedRobot(CarryBox):
             dtype=torch.long,
             device=self.device,
         )
+        self._freeze_force_trace_baseline()
         self.set_box_perturb_trace_phase("pulse")
         self._commit_box_perturbation(
             env_ids,
@@ -395,6 +437,64 @@ class LeggedRobot(CarryBox):
             self.rigid_body_states[env_id, right_index, 7:10] - box_vel
         )
         threshold = float(self.cfg.interaction_priv.hand_contact_force_threshold)
+        eps = 1.0e-6
+
+        # Lock one box face per hand after confirmed carry.  This is only an
+        # estimated contact normal; raw is still the hand body's net force.
+        if bool(self.confirmed_carry_buf[env_id].item()) and not bool(torch.all(self._trace_face_locked)):
+            hand_pos = self.rigid_body_states[env_id, [left_index, right_index], 0:3]
+            relative_world = hand_pos - self.box_states[env_id, 0:3]
+            q = self.box_states[env_id, 3:7].unsqueeze(0).expand(2, -1)
+            relative_local = quat_rotate_inverse(q, relative_world)
+            box_size = self._box_size[env_id].unsqueeze(0).expand(2, -1)
+            normal_local, face_id = estimate_box_face_normal_local(relative_local, box_size, eps)
+            new_lock = ~self._trace_face_locked
+            self._trace_normal_local[new_lock] = normal_local[new_lock]
+            self._trace_face_id[new_lock] = face_id[new_lock]
+            self._trace_face_locked[new_lock] = True
+
+        q = self.box_states[env_id, 3:7].unsqueeze(0).expand(2, -1)
+        normal_world = quat_rotate(q, self._trace_normal_local)
+        raw = torch.stack((left_on_hand, right_on_hand), dim=0)
+        verify = (
+            bool(self.confirmed_carry_buf[env_id].item())
+            & self._trace_face_locked
+            & ~self._trace_sign_verified
+        )
+        outward_dot = torch.sum(raw * normal_world, dim=-1)
+        self._trace_sign_sum += torch.where(verify, outward_dot, torch.zeros_like(outward_dot))
+        self._trace_sign_count += verify.long()
+        sign_samples = int(getattr(self.cfg.box_perturbation, "force_sign_verification_samples", 12))
+        ready = verify & (self._trace_sign_count >= sign_samples)
+        self._trace_normal_sign[ready] = torch.where(
+            self._trace_sign_sum[ready] < 0.0, -1.0, 1.0
+        )
+        self._trace_sign_verified[ready] = True
+        normal_world = normal_world * self._trace_normal_sign.unsqueeze(-1)
+        fn_signed, fn, _, ft_vector, ft = decompose_force(raw, normal_world)
+
+        alpha = math.exp(-float(self.sim_params.dt) / 0.04)
+        analysis_gate = self._trace_face_locked & bool(self.confirmed_carry_buf[env_id].item())
+        first = analysis_gate & ~self._trace_ema_initialized
+        self._trace_fn_ema[first] = fn[first]
+        self._trace_ft_ema[first] = ft[first]
+        update = analysis_gate & self._trace_ema_initialized
+        self._trace_fn_ema[update] = alpha * self._trace_fn_ema[update] + (1.0 - alpha) * fn[update]
+        self._trace_ft_ema[update] = alpha * self._trace_ft_ema[update] + (1.0 - alpha) * ft[update]
+        self._trace_ema_initialized |= analysis_gate
+        rho = ft / (fn + eps)
+        asymmetry = torch.abs(fn[0] - fn[1]) / (fn.sum() + eps)
+        closure = force_closure_residual(raw.unsqueeze(0), box_net_contact.unsqueeze(0), eps)[0]
+        contacts = torch.linalg.vector_norm(raw, dim=-1) > threshold
+        closure_max = float(getattr(self.cfg.box_perturbation, "force_closure_residual_max", 0.2))
+        force_valid = bool(
+            self.confirmed_carry_buf[env_id].item()
+            and torch.all(contacts).item()
+            and torch.all(self._trace_sign_verified).item()
+            and torch.all(fn_signed > 0.0).item()
+            and closure.item() <= closure_max
+        )
+        self._trace_impulse_Ns += float(torch.linalg.vector_norm(f_ext).item()) * float(self.sim_params.dt)
         if self.box_perturb_trace_phase == "pulse":
             audit = self._pairwise_hand_box_contact_audit(env_id)
         else:
@@ -425,6 +525,13 @@ class LeggedRobot(CarryBox):
             "beta": float(self.box_perturb_beta[env_id].item()),
             "box_mass_kg": float(self.box_masses[env_id].item()),
             "force_peak_N": float(self.box_perturb_peak_force_N[env_id].item()),
+            "force_uncapped_peak_N": float(
+                self.box_perturb_beta[env_id].item() * self.box_masses[env_id].item() * 9.81
+            ),
+            "force_cap_used": int(self.box_perturb_cap_used_buf[env_id].item()),
+            "force_impulse_Ns": self._trace_impulse_Ns,
+            "force_baseline_sample_count": self._trace_force_baseline_count,
+            "force_baseline_unavailable": int(self._trace_force_baseline is None),
             "confirmed_streak_at_schedule": int(
                 self.box_perturb_schedule_confirmed_streak[env_id].item()
             ),
@@ -444,28 +551,65 @@ class LeggedRobot(CarryBox):
             "left_contact": int(left_norm.item() > threshold),
             "right_contact": int(right_norm.item() > threshold),
             "confirmed_carry": int(self.confirmed_carry_buf[env_id].item()),
+            "left_face_id": int(self._trace_face_id[0].item()),
+            "right_face_id": int(self._trace_face_id[1].item()),
+            "normal_sign_verified": int(torch.all(self._trace_sign_verified).item()),
+            "left_fn_signed_N": float(fn_signed[0].item()),
+            "right_fn_signed_N": float(fn_signed[1].item()),
+            "left_fn_raw_N": float(fn[0].item()),
+            "right_fn_raw_N": float(fn[1].item()),
+            "left_ft_raw_N": float(ft[0].item()),
+            "right_ft_raw_N": float(ft[1].item()),
+            "left_fn_ema_N": float(self._trace_fn_ema[0].item()),
+            "right_fn_ema_N": float(self._trace_fn_ema[1].item()),
+            "left_ft_ema_N": float(self._trace_ft_ema[0].item()),
+            "right_ft_ema_N": float(self._trace_ft_ema[1].item()),
+            "left_rho_raw": float(rho[0].item()),
+            "right_rho_raw": float(rho[1].item()),
+            "normal_load_asymmetry": float(asymmetry.item()),
+            "force_closure_residual": float(closure.item()),
+            "force_decomposition_valid": int(force_valid),
             "box_lin_speed_mps": float(torch.linalg.vector_norm(box_vel).item()),
             "box_ang_speed_radps": float(
                 torch.linalg.vector_norm(box_ang_vel).item()
             ),
             **vec("f_ext_world_N", f_ext),
+            **vec("left_hand_net_contact_force_world_N", left_on_hand),
+            **vec("right_hand_net_contact_force_world_N", right_on_hand),
             **vec("left_hand_on_box_proxy_world_N", left_on_box),
             **vec("right_hand_on_box_proxy_world_N", right_on_box),
             **vec("box_net_contact_force_world_N", box_net_contact),
             **vec("box_lin_vel_world_mps", box_vel),
             **vec("box_ang_vel_world_radps", box_ang_vel),
+            **vec("perturb_direction_world", direction),
+            **vec("left_face_normal_world", normal_world[0]),
+            **vec("right_face_normal_world", normal_world[1]),
+            **vec("left_face_normal_box", self._trace_normal_local[0] * self._trace_normal_sign[0]),
+            **vec("right_face_normal_box", self._trace_normal_local[1] * self._trace_normal_sign[1]),
+            **vec("left_tangential_force_world_N", ft_vector[0]),
+            **vec("right_tangential_force_world_N", ft_vector[1]),
             **audit,
         }
+        baseline_keys = (
+            "left_fn_raw_N", "right_fn_raw_N", "left_ft_raw_N", "right_ft_raw_N",
+            "left_fn_ema_N", "right_fn_ema_N", "left_ft_ema_N", "right_ft_ema_N",
+        )
+        for key in baseline_keys:
+            baseline = float("nan") if self._trace_force_baseline is None else self._trace_force_baseline[key]
+            row[f"{key}_pre_baseline"] = baseline
+            row[f"{key}_delta_from_pre"] = float("nan") if self._trace_force_baseline is None else row[key] - baseline
         self.box_perturb_force_trace.append(row)
-        if self.box_perturb_trace_verbose and row["f_ext_norm_N"] > 1.0e-6:
+        if self.box_perturb_trace_verbose:
             print(
                 "[ForceTrace] "
-                f"k={row['elapsed_pulse_physics_steps']:02d} "
+                f"phase={row['phase']} k={row['elapsed_pulse_physics_steps']:02d} "
                 f"Fext={row['f_ext_norm_N']:.4f}N "
-                f"Lhand={row['left_hand_on_box_proxy_norm_N']:.4f}N "
-                f"Rhand={row['right_hand_on_box_proxy_norm_N']:.4f}N "
-                f"resist={row['resistive_hand_force_N']:.4f}N "
-                f"confirmed={row['confirmed_carry']}"
+                f"L(Fn/Ft)={row['left_fn_raw_N']:.4f}/{row['left_ft_raw_N']:.4f}N "
+                f"R(Fn/Ft)={row['right_fn_raw_N']:.4f}/{row['right_ft_raw_N']:.4f}N "
+                f"EMA_L={row['left_fn_ema_N']:.4f}/{row['left_ft_ema_N']:.4f}N "
+                f"EMA_R={row['right_fn_ema_N']:.4f}/{row['right_ft_ema_N']:.4f}N "
+                f"rho={row['left_rho_raw']:.3f}/{row['right_rho_raw']:.3f} "
+                f"closure={row['force_closure_residual']:.3f} valid={row['force_decomposition_valid']}"
             )
 
     def _schedule_box_perturbation(self, env_ids):
@@ -488,13 +632,13 @@ class LeggedRobot(CarryBox):
             if not torch.any(mask):
                 continue
             direction_ids[mask] = self._DIRECTION_IDS[direction_name]
-            axis_name = "z" if direction_name == "-z_world" else direction_name[-1]
+            axis_name = "z" if direction_name.endswith("z_world") else direction_name[-1]
             low, high = stage_cfg["beta"][axis_name]
             beta[mask] = float(low) + (float(high) - float(low)) * torch.rand(
                 int(mask.sum().item()), device=self.device
             )
-            if direction_name == "-z_world":
-                direction_world[mask, 2] = -1.0
+            if direction_name.endswith("z_world"):
+                direction_world[mask, 2] = 1.0 if direction_name[0] == "+" else -1.0
             else:
                 local_axis = torch.zeros((int(mask.sum().item()), 3), device=self.device)
                 component = 0 if axis_name == "x" else 1
@@ -585,8 +729,8 @@ class LeggedRobot(CarryBox):
             beta_value = float(betas[beta_level])
             selected_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
             direction_world = torch.zeros((1, 3), device=self.device)
-            if direction_name == "-z_world":
-                direction_world[0, 2] = -1.0
+            if direction_name.endswith("z_world"):
+                direction_world[0, 2] = 1.0 if direction_name[0] == "+" else -1.0
             else:
                 local_axis = torch.zeros((1, 3), device=self.device)
                 axis_name = direction_name[-1]
