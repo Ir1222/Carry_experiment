@@ -744,7 +744,7 @@ def main(parsed):
         "eval_goal_distance_range": list(parsed.eval_goal_distance_range),
         "eval_goal_bearing_offset_deg": list(parsed.eval_goal_bearing_offset_deg),
         "coordinate_convention": {
-            "box_xy": "box-local axes rotated to world at schedule time",
+            "box_xy": "box-local axes recomputed from the current box orientation every physics substep",
             "world_z": "gravity-aligned world axis", "force": "world-frame N", "impulse": "N s",
         },
         "physics_dt_s": float(env.sim_params.dt), "policy_dt_s": float(env.dt),

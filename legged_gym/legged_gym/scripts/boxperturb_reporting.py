@@ -201,7 +201,9 @@ All force values are SI units unless stated otherwise.
 
 | Variable | Meaning | Unit | Directionality |
 |---|---|---:|---|
-| `direction` | Nominal perturbation direction token. `box_x/y` are box-local axes at schedule time; `world_z` is gravity-aligned. | - | diagnostic |
+| `direction` | Nominal perturbation direction token. `box_x/y` are box-local axes recomputed from the current box orientation every physics substep; `world_z` is gravity-aligned. | - | diagnostic |
+| `perturb_direction_local_{x,y,z}` | Stored local/world semantic direction. For `box_x/y` this is box-local; for `world_z` this is already world Z. | - | diagnostic |
+| `perturb_direction_is_world` | `1` for `±world_z`, `0` for box-local directions. | 0/1 | diagnostic |
 | `requested_beta` | Requested force scale. `F_uncapped = beta * box_mass_kg * 9.81`. | - | larger is stronger |
 | `force_uncapped_peak_N` | Peak force before cap. | N | larger is stronger |
 | `force_peak_N` | Actual capped peak force. | N | larger is stronger |

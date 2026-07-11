@@ -386,7 +386,7 @@ def run_boxperturb_visual_sweep(env, policy, args):
     metadata = {
         "mode": "play", "checkpoint": args.resume_path, "seed": seed,
         "coordinate_convention": {
-            "box_xy": "box-local axes rotated to world at schedule time",
+            "box_xy": "box-local axes recomputed from the current box orientation every physics substep",
             "world_z": "gravity-aligned world axis",
             "force": "world-frame N", "impulse": "N s",
         },

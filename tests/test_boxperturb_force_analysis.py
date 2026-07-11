@@ -134,6 +134,21 @@ def test_offset_force_torque_formula_and_boundary_summary():
     assert rows[0]["min_degradation_beta"] == 1.0
 
 
+def test_box_following_direction_math():
+    yaw = math.pi / 2.0
+    rot_z = torch.tensor(
+        [
+            [math.cos(yaw), -math.sin(yaw), 0.0],
+            [math.sin(yaw), math.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    box_x_local = torch.tensor([1.0, 0.0, 0.0])
+    world_z = torch.tensor([0.0, 0.0, 1.0])
+    assert torch.allclose(rot_z @ box_x_local, torch.tensor([0.0, 1.0, 0.0]), atol=1e-6)
+    assert torch.allclose(world_z, torch.tensor([0.0, 0.0, 1.0]))
+
+
 def test_six_direction_registry_and_observation_dimensions_are_unchanged():
     perturb_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
     config_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb_resume_config.py").read_text()
@@ -152,6 +167,10 @@ def test_six_direction_registry_and_observation_dimensions_are_unchanged():
     assert "apply_rigid_body_force_at_pos_tensors" in perturb_source
     assert "external_torque_world" in perturb_source
     assert "set_evaluation_long_range_goal" in perturb_source
+    assert "box_perturb_direction_local" in perturb_source
+    assert "box_perturb_direction_is_world" in perturb_source
+    assert "direction_world = self._current_perturb_direction_world(active)" in perturb_source
+    assert "force = peak_force_world * profile.unsqueeze(1)" in perturb_source
 
 
 def test_perturb_termination_does_not_require_disabled_long_range_buffers():
