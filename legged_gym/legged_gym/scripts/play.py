@@ -28,6 +28,18 @@ def _parse_csv_strings(value, default):
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
+def _parse_float_pair(value, default):
+    if value is None:
+        return tuple(float(item) for item in default)
+    if isinstance(value, (list, tuple)):
+        values = [float(item) for item in value]
+    else:
+        values = [float(item.strip()) for item in str(value).split(",") if item.strip()]
+    if len(values) != 2:
+        raise ValueError(f"Expected exactly two comma-separated values, got: {value}")
+    return tuple(values)
+
+
 def _parse_force_cap(value, default):
     if value is None:
         return default
@@ -57,8 +69,8 @@ def _apply_eval_goal_if_requested(env, args):
     if args.eval_goal_mode != "long_range":
         raise ValueError(f"Unknown eval goal mode: {args.eval_goal_mode}")
     return env.set_evaluation_long_range_goal(
-        distance_range=tuple(args.eval_goal_distance_range),
-        bearing_offset_deg=tuple(args.eval_goal_bearing_offset_deg),
+        distance_range=_parse_float_pair(args.eval_goal_distance_range, (4.0, 8.0)),
+        bearing_offset_deg=_parse_float_pair(args.eval_goal_bearing_offset_deg, (15.0, 75.0)),
         env_id=0,
     )
 
@@ -209,6 +221,8 @@ def run_boxperturb_visual_sweep(env, policy, args):
     pulse_durations = _parse_csv_floats(args.force_sweep_pulse_durations, (cfg.pulse_duration_s,))
     pulse_profiles = _parse_csv_strings(args.force_sweep_pulse_profiles, (cfg.pulse_profile,))
     force_cap = _parse_force_cap(args.force_peak_cap_N, cfg.force_peak_cap_N)
+    eval_goal_distance_range = _parse_float_pair(args.eval_goal_distance_range, (4.0, 8.0))
+    eval_goal_bearing_offset_deg = _parse_float_pair(args.eval_goal_bearing_offset_deg, (15.0, 75.0))
     unknown = [name for name in directions if name not in env._DIRECTION_IDS]
     if unknown:
         raise ValueError(f"Unknown force sweep directions: {unknown}")
@@ -382,8 +396,8 @@ def run_boxperturb_visual_sweep(env, policy, args):
         "force_peak_cap_N": force_cap,
         "force_point_specs": [{"mode": mode, "label": label} for mode, label in point_specs],
         "eval_goal_mode": args.eval_goal_mode,
-        "eval_goal_distance_range": list(args.eval_goal_distance_range),
-        "eval_goal_bearing_offset_deg": list(args.eval_goal_bearing_offset_deg),
+        "eval_goal_distance_range": list(eval_goal_distance_range),
+        "eval_goal_bearing_offset_deg": list(eval_goal_bearing_offset_deg),
         "directions": list(directions), "betas": list(betas),
         "force_decomposition": "hand rigid-body net contact force projected on estimated locked box-face normal",
         "ema_tau_s": 0.04, "baseline_valid_physics_substeps": 40,
@@ -426,8 +440,8 @@ def play(args):
             env_cfg.box_perturbation.evaluation_manual_schedule = True
             env_cfg.box_perturbation.evaluation_trace_enabled = True
             env_cfg.box_perturbation.evaluation_goal_mode = args.eval_goal_mode
-            env_cfg.box_perturbation.evaluation_goal_distance_range = tuple(args.eval_goal_distance_range)
-            env_cfg.box_perturbation.evaluation_goal_bearing_offset_deg = tuple(args.eval_goal_bearing_offset_deg)
+            env_cfg.box_perturbation.evaluation_goal_distance_range = _parse_float_pair(args.eval_goal_distance_range, (4.0, 8.0))
+            env_cfg.box_perturbation.evaluation_goal_bearing_offset_deg = _parse_float_pair(args.eval_goal_bearing_offset_deg, (15.0, 75.0))
             env_cfg.box_perturbation.evaluation_precondition_timeout_s = float(args.eval_precondition_timeout_s)
             env_cfg.box_perturbation.evaluation_verbose_substeps = (
                 args.verbose_force_trace
