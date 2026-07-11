@@ -210,6 +210,16 @@ def get_args():
         {"name": "--verbose_force_trace", "action": "store_true", "default": False, "help": "Print every physics-substep external and hand-force sample during perturbation evaluation."},
         {"name": "--force_sweep_directions", "type": str, "default": None, "help": "Comma-separated explicit sweep directions."},
         {"name": "--force_sweep_betas", "type": str, "default": None, "help": "Comma-separated explicit sweep beta values."},
+        {"name": "--force_sweep_point_modes", "type": str, "default": "com", "help": "Comma-separated force point modes: com, box_surface_grid, box_surface_random."},
+        {"name": "--force_sweep_point_labels", "type": str, "default": "face_center,face_upper,face_lower,face_left_edge,face_right_edge", "help": "Comma-separated labels used by box_surface_grid."},
+        {"name": "--force_sweep_pulse_durations", "type": str, "default": "0.10", "help": "Comma-separated pulse durations in seconds."},
+        {"name": "--force_sweep_pulse_profiles", "type": str, "default": "half_sine", "help": "Comma-separated pulse profiles: half_sine, ramp_hold, multi_pulse, jittered_half_sine."},
+        {"name": "--force_peak_cap_N", "type": str, "default": None, "help": "Evaluation force cap in N; use 'none' for uncapped."},
+        {"name": "--eval_goal_mode", "type": str, "default": "default", "help": "Evaluation goal mode: default or long_range."},
+        {"name": "--eval_goal_distance_range", "nargs": 2, "type": float, "default": [4.0, 8.0], "help": "Long-range eval goal distance range in meters."},
+        {"name": "--eval_goal_bearing_offset_deg", "nargs": 2, "type": float, "default": [15.0, 75.0], "help": "Long-range eval goal bearing offset range in degrees."},
+        {"name": "--eval_episode_length_s", "type": float, "default": 180.0, "help": "Episode length for perturbation evaluation sweeps."},
+        {"name": "--eval_precondition_timeout_s", "type": float, "default": 8.0, "help": "Timeout for reaching confirmed carry before perturbation."},
         {"name": "--boxperturb_output_dir", "type": str, "default": None, "help": "Directory for perturbation CSV and metadata outputs."},
     ]
     # parse arguments

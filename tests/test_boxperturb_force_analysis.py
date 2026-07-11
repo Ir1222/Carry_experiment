@@ -105,6 +105,35 @@ def test_half_sine_midpoint_peak_cap_and_impulse():
     assert abs(sum(samples) * dt - expected_impulse) < 0.002
 
 
+def test_offset_force_torque_formula_and_boundary_summary():
+    r = torch.tensor([0.0, 0.15, 0.05])
+    f = torch.tensor([10.0, 0.0, 0.0])
+    assert torch.allclose(torch.cross(r, f, dim=0), torch.tensor([0.0, 0.5, -1.5]))
+    trials = [
+        {
+            "model": "m", "direction": "+box_x", "requested_beta": 0.5,
+            "force_point_mode": "box_surface_grid", "force_point_label": "face_upper",
+            "pulse_duration_s": 0.1, "pulse_profile": "half_sine",
+            "precondition_success": 1, "termination": 0, "post_confirmed_ratio": 1.0,
+            "recovery_success": 1, "pulse_force_valid_fraction": 1.0,
+            "hand_box_rel_speed_peak_mps": 0.2,
+        },
+        {
+            "model": "m", "direction": "+box_x", "requested_beta": 1.0,
+            "force_point_mode": "box_surface_grid", "force_point_label": "face_upper",
+            "pulse_duration_s": 0.1, "pulse_profile": "half_sine",
+            "precondition_success": 1, "termination": 1, "post_confirmed_ratio": 0.0,
+            "recovery_success": 0, "pulse_force_valid_fraction": 0.0,
+            "hand_box_rel_speed_peak_mps": 2.0,
+        },
+    ]
+    rows = reporting.build_boundary_rows(trials)
+    assert len(rows) == 1
+    assert rows[0]["max_pass_beta"] == 0.5
+    assert rows[0]["min_primary_failure_beta"] == 1.0
+    assert rows[0]["min_degradation_beta"] == 1.0
+
+
 def test_six_direction_registry_and_observation_dimensions_are_unchanged():
     perturb_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
     config_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb_resume_config.py").read_text()
@@ -120,6 +149,9 @@ def test_six_direction_registry_and_observation_dimensions_are_unchanged():
     assert "num_actor_obs = 738" in config_source
     assert "num_privileged_obs = 143" in config_source
     assert "num_interaction_priv_obs = 17" in config_source
+    assert "apply_rigid_body_force_at_pos_tensors" in perturb_source
+    assert "external_torque_world" in perturb_source
+    assert "set_evaluation_long_range_goal" in perturb_source
 
 
 def test_perturb_termination_does_not_require_disabled_long_range_buffers():

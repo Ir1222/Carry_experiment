@@ -16,6 +16,53 @@ from legged_gym.scripts.boxperturb_reporting import (
 )
 
 
+def _parse_csv_floats(value, default):
+    if value is None:
+        return tuple(default)
+    return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _parse_csv_strings(value, default):
+    if value is None:
+        return tuple(default)
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _parse_force_cap(value, default):
+    if value is None:
+        return default
+    if str(value).lower() == "none":
+        return None
+    return float(value)
+
+
+def _build_force_point_specs(modes, labels):
+    specs = []
+    for mode in modes:
+        if mode == "com":
+            specs.append(("com", "com"))
+        elif mode == "box_surface_grid":
+            specs.extend((mode, label) for label in labels)
+        elif mode == "box_surface_random":
+            specs.append((mode, "random"))
+        else:
+            raise ValueError(f"Unknown force point mode: {mode}")
+    return specs
+
+
+def _apply_eval_goal_if_requested(env, args):
+    if getattr(args, "eval_goal_mode", "default") == "default":
+        env.compute_observations()
+        return 0.0
+    if args.eval_goal_mode != "long_range":
+        raise ValueError(f"Unknown eval goal mode: {args.eval_goal_mode}")
+    return env.set_evaluation_long_range_goal(
+        distance_range=tuple(args.eval_goal_distance_range),
+        bearing_offset_deg=tuple(args.eval_goal_bearing_offset_deg),
+        env_id=0,
+    )
+
+
 def load_actor_only_for_inference(ppo_runner, checkpoint_path, device):
     """Load a compatible actor while ignoring a training-only critic mismatch."""
     if checkpoint_path is None:
@@ -153,14 +200,15 @@ def _disable_boxperturb_eval_randomization(env_cfg):
 
 def run_boxperturb_visual_sweep(env, policy, args):
     cfg = env.cfg.box_perturbation
-    betas = (
-        tuple(float(value.strip()) for value in args.force_sweep_betas.split(",") if value.strip())
-        if args.force_sweep_betas else tuple(cfg.debug_sweep_beta_values)
+    betas = _parse_csv_floats(args.force_sweep_betas, cfg.debug_sweep_beta_values)
+    directions = _parse_csv_strings(args.force_sweep_directions, cfg.debug_sweep_directions)
+    point_specs = _build_force_point_specs(
+        _parse_csv_strings(args.force_sweep_point_modes, ("com",)),
+        _parse_csv_strings(args.force_sweep_point_labels, ("face_center",)),
     )
-    directions = (
-        tuple(value.strip() for value in args.force_sweep_directions.split(",") if value.strip())
-        if args.force_sweep_directions else tuple(cfg.debug_sweep_directions)
-    )
+    pulse_durations = _parse_csv_floats(args.force_sweep_pulse_durations, (cfg.pulse_duration_s,))
+    pulse_profiles = _parse_csv_strings(args.force_sweep_pulse_profiles, (cfg.pulse_profile,))
+    force_cap = _parse_force_cap(args.force_peak_cap_N, cfg.force_peak_cap_N)
     unknown = [name for name in directions if name not in env._DIRECTION_IDS]
     if unknown:
         raise ValueError(f"Unknown force sweep directions: {unknown}")
@@ -173,20 +221,38 @@ def run_boxperturb_visual_sweep(env, policy, args):
     )
     recovery_steps = env._recovery_policy_steps()
     post_steps = int(round(float(cfg.evaluation_post_window_s) / env.dt))
-    total = len(betas) * len(directions)
+    total = len(betas) * len(directions) * len(point_specs) * len(pulse_durations) * len(pulse_profiles)
     trials = []
     traces = []
 
-    test_cells = [(beta, direction) for beta in betas for direction in directions]
-    for test_index, (beta, direction) in enumerate(test_cells, start=1):
+    test_cells = [
+        (beta, direction, point_mode, point_label, duration, profile)
+        for beta in betas
+        for direction in directions
+        for point_mode, point_label in point_specs
+        for duration in pulse_durations
+        for profile in pulse_profiles
+    ]
+    for test_index, (beta, direction, point_mode, point_label, duration, profile) in enumerate(test_cells, start=1):
         set_seed(seed)
         obs, _ = env.reset()
+        initial_goal_distance = _apply_eval_goal_if_requested(env, args)
+        obs = env.get_observations()
+        force_point_box, resolved_point_label = env.resolve_force_point_box(
+            direction, point_mode, point_label, env_id=0
+        )
         env.begin_box_perturb_trace(
             {
                 "model": "play",
                 "seed": seed,
                 "direction": direction,
                 "requested_beta": float(beta),
+                "force_point_mode": point_mode,
+                "force_point_label": resolved_point_label,
+                "pulse_duration_s": float(duration),
+                "pulse_profile": profile,
+                "initial_goal_distance_xy_m": initial_goal_distance,
+                "eval_goal_mode": args.eval_goal_mode,
                 "test_index": test_index,
             },
             verbose=args.verbose_force_trace,
@@ -209,6 +275,12 @@ def run_boxperturb_visual_sweep(env, policy, args):
             trial = {
                 "model": "play", "seed": seed, "direction": direction,
                 "requested_beta": float(beta), "precondition_success": 0,
+                "force_point_mode": point_mode,
+                "force_point_label": resolved_point_label,
+                "pulse_duration_s": float(duration),
+                "pulse_profile": profile,
+                "initial_goal_distance_xy_m": initial_goal_distance,
+                "goal_distance_xy_m": float(env.object2goal_dist_xy[0].item()),
                 "event_triggered": 0, "peak_force_N": float("nan"),
                 "recovery_success": float("nan"), "termination_reason": env.box_perturb_last_termination_reason[0],
                 "trace_rows": len(trace), **summarize_force_trace(trace),
@@ -217,7 +289,15 @@ def run_boxperturb_visual_sweep(env, policy, args):
             traces.extend(trace)
             continue
 
-        peak = env.schedule_explicit_box_perturbation(direction, beta, env_id=0)
+        peak = env.schedule_explicit_box_perturbation(
+            direction,
+            beta,
+            env_id=0,
+            force_point_box=force_point_box,
+            pulse_duration_s=float(duration),
+            pulse_profile=profile,
+            force_peak_cap_N=force_cap,
+        )
         pulse_finished = False
         after_pulse_steps = 0
         recovery_streak = 0
@@ -270,6 +350,12 @@ def run_boxperturb_visual_sweep(env, policy, args):
         trial = {
             "model": "play", "seed": seed, "direction": direction,
             "requested_beta": float(beta), "precondition_success": 1,
+            "force_point_mode": point_mode,
+            "force_point_label": resolved_point_label,
+            "pulse_duration_s": float(duration),
+            "pulse_profile": profile,
+            "initial_goal_distance_xy_m": initial_goal_distance,
+            "goal_distance_xy_m": goal_end,
             "event_triggered": 1, "peak_force_N": peak,
             "pulse_hold_retention": pulse_hold,
             "recovery_success": int(recovery_success),
@@ -291,9 +377,13 @@ def run_boxperturb_visual_sweep(env, policy, args):
             "force": "world-frame N", "impulse": "N s",
         },
         "physics_dt_s": float(env.sim_params.dt), "policy_dt_s": float(env.dt),
-        "pulse_profile": "midpoint-sampled half-sine",
-        "pulse_duration_s": float(cfg.pulse_duration_s),
-        "force_peak_cap_N": cfg.force_peak_cap_N,
+        "pulse_profiles": list(pulse_profiles),
+        "pulse_durations_s": list(pulse_durations),
+        "force_peak_cap_N": force_cap,
+        "force_point_specs": [{"mode": mode, "label": label} for mode, label in point_specs],
+        "eval_goal_mode": args.eval_goal_mode,
+        "eval_goal_distance_range": list(args.eval_goal_distance_range),
+        "eval_goal_bearing_offset_deg": list(args.eval_goal_bearing_offset_deg),
         "directions": list(directions), "betas": list(betas),
         "force_decomposition": "hand rigid-body net contact force projected on estimated locked box-face normal",
         "ema_tau_s": 0.04, "baseline_valid_physics_substeps": 40,
@@ -331,10 +421,14 @@ def play(args):
         )
         if args.debug_force_sweep:
             env_cfg.env.num_envs = 1
-            env_cfg.env.episode_length_s = 120
+            env_cfg.env.episode_length_s = float(args.eval_episode_length_s)
             env_cfg.box_perturbation.evaluation_mode = True
             env_cfg.box_perturbation.evaluation_manual_schedule = True
             env_cfg.box_perturbation.evaluation_trace_enabled = True
+            env_cfg.box_perturbation.evaluation_goal_mode = args.eval_goal_mode
+            env_cfg.box_perturbation.evaluation_goal_distance_range = tuple(args.eval_goal_distance_range)
+            env_cfg.box_perturbation.evaluation_goal_bearing_offset_deg = tuple(args.eval_goal_bearing_offset_deg)
+            env_cfg.box_perturbation.evaluation_precondition_timeout_s = float(args.eval_precondition_timeout_s)
             env_cfg.box_perturbation.evaluation_verbose_substeps = (
                 args.verbose_force_trace
             )

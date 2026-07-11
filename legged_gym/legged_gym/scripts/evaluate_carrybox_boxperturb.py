@@ -27,6 +27,29 @@ from legged_gym.scripts.boxperturb_reporting import (
 TASK = "carrybox_boxperturb_resume"
 DEFAULT_DIRECTIONS = ("+box_x", "-box_x", "+box_y", "-box_y", "+z_world", "-z_world")
 DEFAULT_BETAS = (0.10, 0.25, 0.50, 0.75)
+DEFAULT_POINT_LABELS = ("face_center", "face_upper", "face_lower", "face_left_edge", "face_right_edge")
+
+
+def _parse_force_cap(value, default):
+    if value is None:
+        return default
+    if str(value).lower() == "none":
+        return None
+    return float(value)
+
+
+def _build_force_point_specs(modes, labels):
+    specs = []
+    for mode in modes:
+        if mode == "com":
+            specs.append(("com", "com"))
+        elif mode == "box_surface_grid":
+            specs.extend((mode, label) for label in labels)
+        elif mode == "box_surface_random":
+            specs.append((mode, "random"))
+        else:
+            raise ValueError(f"Unknown force point mode: {mode}")
+    return specs
 
 
 def _make_gym_args(parsed):
@@ -67,9 +90,9 @@ def _make_gym_args(parsed):
     )
 
 
-def _configure_eval(env_cfg):
+def _configure_eval(env_cfg, parsed):
     env_cfg.env.num_envs = 1
-    env_cfg.env.episode_length_s = 120
+    env_cfg.env.episode_length_s = float(parsed.eval_episode_length_s)
     env_cfg.env.test = False
     env_cfg.noise.add_noise = False
     env_cfg.asset.box.reset_mode = "random"
@@ -102,7 +125,24 @@ def _configure_eval(env_cfg):
     perturb.evaluation_manual_schedule = True
     perturb.evaluation_trace_enabled = True
     perturb.evaluation_ignore_task_success_reset = True
+    perturb.evaluation_goal_mode = parsed.eval_goal_mode
+    perturb.evaluation_goal_distance_range = tuple(parsed.eval_goal_distance_range)
+    perturb.evaluation_goal_bearing_offset_deg = tuple(parsed.eval_goal_bearing_offset_deg)
+    perturb.evaluation_precondition_timeout_s = float(parsed.eval_precondition_timeout_s)
     return env_cfg
+
+
+def _apply_eval_goal_if_requested(env, parsed):
+    if parsed.eval_goal_mode == "default":
+        env.compute_observations()
+        return 0.0
+    if parsed.eval_goal_mode != "long_range":
+        raise ValueError(f"Unknown eval goal mode: {parsed.eval_goal_mode}")
+    return env.set_evaluation_long_range_goal(
+        distance_range=tuple(parsed.eval_goal_distance_range),
+        bearing_offset_deg=tuple(parsed.eval_goal_bearing_offset_deg),
+        env_id=0,
+    )
 
 
 def _set_trial_seed(seed):
@@ -180,16 +220,42 @@ def _rms(rows, keys):
     return float(np.sqrt(np.mean(np.square(values)))) if values else float("nan")
 
 
-def _run_trial(env, policy, model_label, checkpoint_path, seed, direction, beta, verbose):
+def _run_trial(
+    env,
+    policy,
+    model_label,
+    checkpoint_path,
+    seed,
+    direction,
+    beta,
+    force_point_mode,
+    force_point_label,
+    pulse_duration_s,
+    pulse_profile,
+    force_peak_cap_N,
+    parsed,
+    verbose,
+):
     cfg = env.cfg.box_perturbation
     _set_trial_seed(int(seed))
     obs, _ = env.reset()
+    initial_goal_distance = _apply_eval_goal_if_requested(env, parsed)
+    obs = env.get_observations()
+    force_point_box, resolved_point_label = env.resolve_force_point_box(
+        direction, force_point_mode, force_point_label, env_id=0
+    )
     metadata = {
         "model": model_label,
         "checkpoint": checkpoint_path,
         "seed": int(seed),
         "direction": direction,
         "requested_beta": float(beta),
+        "force_point_mode": force_point_mode,
+        "force_point_label": resolved_point_label,
+        "pulse_duration_s": float(pulse_duration_s),
+        "pulse_profile": pulse_profile,
+        "initial_goal_distance_xy_m": initial_goal_distance,
+        "eval_goal_mode": parsed.eval_goal_mode,
     }
     env.begin_box_perturb_trace(metadata, verbose=verbose)
     precondition_steps = int(
@@ -229,6 +295,12 @@ def _run_trial(env, policy, model_label, checkpoint_path, seed, direction, beta,
         "fall_failure": 0,
         "post_confirmed_ratio": float("nan"),
         "goal_progress_m": float("nan"),
+        "initial_goal_distance_xy_m": initial_goal_distance,
+        "goal_distance_xy_m": float(env.object2goal_dist_xy[0].item()),
+        "force_point_mode": force_point_mode,
+        "force_point_label": resolved_point_label,
+        "pulse_duration_s": float(pulse_duration_s),
+        "pulse_profile": pulse_profile,
         "max_abs_roll_rad": max_abs_roll,
         "max_abs_pitch_rad": max_abs_pitch,
     }
@@ -252,7 +324,15 @@ def _run_trial(env, policy, model_label, checkpoint_path, seed, direction, beta,
         return base_summary, trace
 
     goal_start = float(env.object2goal_dist_xy[0].item())
-    peak = env.schedule_explicit_box_perturbation(direction, beta, env_id=0)
+    peak = env.schedule_explicit_box_perturbation(
+        direction,
+        beta,
+        env_id=0,
+        force_point_box=force_point_box,
+        pulse_duration_s=float(pulse_duration_s),
+        pulse_profile=pulse_profile,
+        force_peak_cap_N=force_peak_cap_N,
+    )
     pulse_finished = False
     after_pulse_steps = 0
     recovery_streak = 0
@@ -329,6 +409,7 @@ def _run_trial(env, policy, model_label, checkpoint_path, seed, direction, beta,
         ),
         post_confirmed_ratio=float(np.mean(post_confirmed)) if post_confirmed else 0.0,
         goal_progress_m=(goal_start - goal_end if math.isfinite(goal_end) else float("nan")),
+        goal_distance_xy_m=goal_end,
         max_abs_roll_rad=max_abs_roll,
         max_abs_pitch_rad=max_abs_pitch,
         external_impulse_Ns=sum(row["f_ext_norm_N"] for row in pulse_rows)
@@ -406,7 +487,15 @@ def _write_csv(path, rows):
 def _aggregate(trials):
     groups = defaultdict(list)
     for trial in trials:
-        groups[(trial["model"], trial["direction"], trial["requested_beta"])].append(trial)
+        groups[(
+            trial["model"],
+            trial["direction"],
+            trial["requested_beta"],
+            trial.get("force_point_mode", "com"),
+            trial.get("force_point_label", "com"),
+            trial.get("pulse_duration_s", 0.10),
+            trial.get("pulse_profile", "half_sine"),
+        )].append(trial)
     metric_names = (
         "pulse_hold_retention",
         "pulse_bimanual_contact_retention",
@@ -432,12 +521,16 @@ def _aggregate(trials):
         for suffix in ("pre_mean", "pulse_mean", "pulse_peak", "pulse_delta_from_pre")
     )
     summary = []
-    for (model, direction, beta), rows in sorted(groups.items()):
+    for (model, direction, beta, point_mode, point_label, duration, profile), rows in sorted(groups.items()):
         valid = [row for row in rows if row["precondition_success"]]
         item = {
             "model": model,
             "direction": direction,
             "beta": beta,
+            "force_point_mode": point_mode,
+            "force_point_label": point_label,
+            "pulse_duration_s": duration,
+            "pulse_profile": profile,
             "trials": len(rows),
             "precondition_success_rate": sum(row["precondition_success"] for row in rows) / len(rows),
             "conditional_recovery_success_rate": (
@@ -469,7 +562,16 @@ def _aggregate(trials):
 
 def _paired_comparison(trials, baseline_label, interaction_label):
     by_key = {
-        (row["model"], row["direction"], row["requested_beta"], row["seed"]): row
+        (
+            row["model"],
+            row["direction"],
+            row["requested_beta"],
+            row.get("force_point_mode", "com"),
+            row.get("force_point_label", "com"),
+            row.get("pulse_duration_s", 0.10),
+            row.get("pulse_profile", "half_sine"),
+            row["seed"],
+        ): row
         for row in trials
     }
     metrics = (
@@ -530,14 +632,32 @@ def _paired_comparison(trials, baseline_label, interaction_label):
         "cells": [],
     }
     cells = sorted(
-        {(row["direction"], row["requested_beta"]) for row in trials}
+        {
+            (
+                row["direction"],
+                row["requested_beta"],
+                row.get("force_point_mode", "com"),
+                row.get("force_point_label", "com"),
+                row.get("pulse_duration_s", 0.10),
+                row.get("pulse_profile", "half_sine"),
+            )
+            for row in trials
+        }
     )
-    for direction, beta in cells:
-        cell = {"direction": direction, "beta": beta, "paired_seed_count": 0}
+    for direction, beta, point_mode, point_label, duration, profile in cells:
+        cell = {
+            "direction": direction,
+            "beta": beta,
+            "force_point_mode": point_mode,
+            "force_point_label": point_label,
+            "pulse_duration_s": duration,
+            "pulse_profile": profile,
+            "paired_seed_count": 0,
+        }
         differences = defaultdict(list)
         for seed in sorted({row["seed"] for row in trials}):
-            a = by_key.get((baseline_label, direction, beta, seed))
-            b = by_key.get((interaction_label, direction, beta, seed))
+            a = by_key.get((baseline_label, direction, beta, point_mode, point_label, duration, profile, seed))
+            b = by_key.get((interaction_label, direction, beta, point_mode, point_label, duration, profile, seed))
             if not a or not b or not a["precondition_success"] or not b["precondition_success"]:
                 continue
             cell["paired_seed_count"] += 1
@@ -556,7 +676,7 @@ def main(parsed):
     os.makedirs(parsed.output_dir, exist_ok=True)
     gym_args = _make_gym_args(parsed)
     env_cfg, train_cfg = task_registry.get_cfgs(TASK)
-    env_cfg = _configure_eval(copy.deepcopy(env_cfg))
+    env_cfg = _configure_eval(copy.deepcopy(env_cfg), parsed)
     train_cfg = copy.deepcopy(train_cfg)
     train_cfg.runner.resume = False
     env, _ = task_registry.make_env(TASK, args=gym_args, env_cfg=env_cfg)
@@ -572,6 +692,10 @@ def main(parsed):
         (parsed.baseline_label, parsed.baseline_checkpoint),
         (parsed.interaction_label, parsed.interaction_checkpoint),
     )
+    point_specs = _build_force_point_specs(parsed.force_point_modes, parsed.force_point_labels)
+    force_peak_cap_N = _parse_force_cap(
+        parsed.force_peak_cap_N, env.cfg.box_perturbation.force_peak_cap_N
+    )
     trials = []
     traces = []
     for label, checkpoint in checkpoints:
@@ -579,19 +703,28 @@ def main(parsed):
         policy = runner.get_inference_policy(device=env.device)
         for beta in parsed.betas:
             for direction in parsed.directions:
-                for seed in parsed.seeds:
-                    trial, trace = _run_trial(
-                        env,
-                        policy,
-                        label,
-                        resolved_path,
-                        seed,
-                        direction,
-                        beta,
-                        parsed.verbose_force_trace,
-                    )
-                    trials.append(trial)
-                    traces.extend(trace)
+                for point_mode, point_label in point_specs:
+                    for pulse_duration_s in parsed.pulse_durations:
+                        for pulse_profile in parsed.pulse_profiles:
+                            for seed in parsed.seeds:
+                                trial, trace = _run_trial(
+                                    env,
+                                    policy,
+                                    label,
+                                    resolved_path,
+                                    seed,
+                                    direction,
+                                    beta,
+                                    point_mode,
+                                    point_label,
+                                    pulse_duration_s,
+                                    pulse_profile,
+                                    force_peak_cap_N,
+                                    parsed,
+                                    parsed.verbose_force_trace,
+                                )
+                                trials.append(trial)
+                                traces.extend(trace)
 
     summary = _aggregate(trials)
     comparison = _paired_comparison(
@@ -604,14 +737,18 @@ def main(parsed):
         },
         "seeds": list(parsed.seeds), "directions": list(parsed.directions),
         "betas": list(parsed.betas),
+        "force_point_specs": [{"mode": mode, "label": label} for mode, label in point_specs],
+        "pulse_durations_s": list(parsed.pulse_durations),
+        "pulse_profiles": list(parsed.pulse_profiles),
+        "eval_goal_mode": parsed.eval_goal_mode,
+        "eval_goal_distance_range": list(parsed.eval_goal_distance_range),
+        "eval_goal_bearing_offset_deg": list(parsed.eval_goal_bearing_offset_deg),
         "coordinate_convention": {
             "box_xy": "box-local axes rotated to world at schedule time",
             "world_z": "gravity-aligned world axis", "force": "world-frame N", "impulse": "N s",
         },
         "physics_dt_s": float(env.sim_params.dt), "policy_dt_s": float(env.dt),
-        "pulse_profile": "midpoint-sampled half-sine",
-        "pulse_duration_s": float(env.cfg.box_perturbation.pulse_duration_s),
-        "force_peak_cap_N": env.cfg.box_perturbation.force_peak_cap_N,
+        "force_peak_cap_N": force_peak_cap_N,
         "force_decomposition": "hand rigid-body net contact force projected on estimated locked box-face normal",
         "ema_tau_s": 0.04, "baseline_valid_physics_substeps": 40,
         "force_sign_verification_samples": int(env.cfg.box_perturbation.force_sign_verification_samples),
@@ -642,6 +779,16 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3, 4, 5])
     parser.add_argument("--directions", nargs="+", default=list(DEFAULT_DIRECTIONS))
     parser.add_argument("--betas", nargs="+", type=float, default=list(DEFAULT_BETAS))
+    parser.add_argument("--force_point_modes", nargs="+", default=["com"])
+    parser.add_argument("--force_point_labels", nargs="+", default=list(DEFAULT_POINT_LABELS))
+    parser.add_argument("--pulse_durations", nargs="+", type=float, default=[0.10])
+    parser.add_argument("--pulse_profiles", nargs="+", default=["half_sine"])
+    parser.add_argument("--force_peak_cap_N", default=None)
+    parser.add_argument("--eval_goal_mode", choices=("default", "long_range"), default="default")
+    parser.add_argument("--eval_goal_distance_range", nargs=2, type=float, default=[4.0, 8.0])
+    parser.add_argument("--eval_goal_bearing_offset_deg", nargs=2, type=float, default=[15.0, 75.0])
+    parser.add_argument("--eval_episode_length_s", type=float, default=180.0)
+    parser.add_argument("--eval_precondition_timeout_s", type=float, default=8.0)
     parser.add_argument("--output_dir", default="logs/boxperturb_ab")
     parser.add_argument("--rl_device", default="cuda:0")
     parser.add_argument("--sim_device", default="cuda:0")

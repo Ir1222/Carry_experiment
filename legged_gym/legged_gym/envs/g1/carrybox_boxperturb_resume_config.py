@@ -27,6 +27,8 @@ class G1Cfg(CarryBoxResumeCfg):
         stable_confirmed_carry_policy_steps = 20
         max_events_per_episode = 1
         pulse_duration_s = 0.10
+        pulse_profile = "half_sine"
+        jittered_half_sine_amplitude = 0.15
         force_peak_cap_N = 10.0
         force_sign_verification_samples = 12
         force_closure_residual_max = 0.20
@@ -104,6 +106,9 @@ class G1Cfg(CarryBoxResumeCfg):
         evaluation_ignore_task_success_reset = False
         evaluation_precondition_timeout_s = 5.0
         evaluation_post_window_s = 2.0
+        evaluation_goal_mode = "default"
+        evaluation_goal_distance_range = (4.0, 8.0)
+        evaluation_goal_bearing_offset_deg = (15.0, 75.0)
 
 
 class G1CfgPPO(CarryBoxResumeCfgPPO):

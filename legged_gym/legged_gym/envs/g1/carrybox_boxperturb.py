@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from isaacgym import gymapi, gymtorch
-from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
+from isaacgym.torch_utils import quat_from_angle_axis, quat_rotate, quat_rotate_inverse
 
 from .carrybox import LeggedRobot as CarryBox
 from .hand_box_force import (
@@ -25,6 +25,13 @@ class LeggedRobot(CarryBox):
         "-z_world": 4,
         "+z_world": 5,
     }
+    _PULSE_PROFILE_IDS = {
+        "half_sine": 0,
+        "ramp_hold": 1,
+        "multi_pulse": 2,
+        "jittered_half_sine": 3,
+    }
+    _PULSE_PROFILE_NAMES = {value: key for key, value in _PULSE_PROFILE_IDS.items()}
 
     def _init_buffers(self):
         super()._init_buffers()
@@ -33,10 +40,19 @@ class LeggedRobot(CarryBox):
 
         # This tensor is intentionally separate from the legacy robot disturbance.
         self.box_perturb_force_tensor = torch.zeros_like(self.disturbance)
+        self.box_perturb_force_pos_tensor = torch.zeros_like(self.disturbance)
         self.box_perturb_peak_force_world = torch.zeros((n, 3), device=device)
         self.box_perturb_direction_world = torch.zeros((n, 3), device=device)
+        self.box_perturb_force_point_box = torch.zeros((n, 3), device=device)
+        self.box_perturb_force_point_world = torch.zeros((n, 3), device=device)
+        self.box_perturb_external_torque_world = torch.zeros((n, 3), device=device)
         self.box_perturb_peak_force_N = torch.zeros(n, device=device)
+        self.box_perturb_force_peak_cap_N = torch.full((n,), float("nan"), device=device)
         self.box_perturb_beta = torch.zeros(n, device=device)
+        self.box_perturb_actual_force_scale = torch.zeros(n, device=device)
+        self.box_perturb_pulse_steps = torch.zeros(n, dtype=torch.long, device=device)
+        self.box_perturb_pulse_duration_s = torch.zeros(n, device=device)
+        self.box_perturb_pulse_profile_id_buf = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_elapsed_physics_steps = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_remaining_physics_steps = torch.zeros(n, dtype=torch.long, device=device)
 
@@ -125,34 +141,87 @@ class LeggedRobot(CarryBox):
         )
 
     def _apply_box_perturbation_force(self):
-        """Apply a midpoint-sampled half-sine force at the box rigid-body COM."""
+        """Apply the configured pulse at the box COM or a world force point."""
         self.box_perturb_force_tensor.zero_()
+        self.box_perturb_force_pos_tensor.zero_()
+        self.box_perturb_actual_force_scale.zero_()
+        self.box_perturb_force_point_world[:] = self.box_states[:, 0:3]
+        self.box_perturb_external_torque_world.zero_()
         active = (
             bool(self.cfg.box_perturbation.enabled)
             & (self.box_perturb_remaining_physics_steps > 0)
         )
         if torch.any(active):
-            pulse_steps = self._pulse_physics_steps()
+            pulse_steps = torch.clamp(self.box_perturb_pulse_steps[active].float(), min=1.0)
             tau_fraction = (
                 self.box_perturb_elapsed_physics_steps[active].float() + 0.5
-            ) / float(pulse_steps)
-            profile = torch.sin(math.pi * tau_fraction)
+            ) / pulse_steps
+            profile = self._pulse_profile_scale(
+                tau_fraction, self.box_perturb_pulse_profile_id_buf[active]
+            )
             force = self.box_perturb_peak_force_world[active] * profile.unsqueeze(1)
+            point_offset_world = quat_rotate(
+                self.box_states[active, 3:7], self.box_perturb_force_point_box[active]
+            )
+            point_world = self.box_states[active, 0:3] + point_offset_world
             self.box_perturb_force_tensor[
                 active, int(self.box_net_contact_force_index), :
             ] = force
+            self.box_perturb_force_pos_tensor[
+                active, int(self.box_net_contact_force_index), :
+            ] = point_world
+            self.box_perturb_force_point_world[active] = point_world
+            self.box_perturb_external_torque_world[active] = torch.cross(
+                point_offset_world, force, dim=-1
+            )
+            self.box_perturb_actual_force_scale[active] = profile
 
+        offset_norm = torch.linalg.vector_norm(self.box_perturb_force_point_box, dim=-1)
+        use_force_at_pos = torch.any(active & (offset_norm > 1.0e-6))
         # ENV_SPACE has world-aligned axes for these untranslated/unrotated env frames.
-        # The rigid-body tensor API acts at each body COM and supplies no torque.
-        self.gym.apply_rigid_body_force_tensors(
-            self.sim,
-            forceTensor=gymtorch.unwrap_tensor(self.box_perturb_force_tensor),
-            space=gymapi.CoordinateSpace.ENV_SPACE,
-        )
+        if bool(use_force_at_pos):
+            if not hasattr(self.gym, "apply_rigid_body_force_at_pos_tensors"):
+                raise RuntimeError(
+                    "Isaac Gym force-at-position tensor API is unavailable; "
+                    "cannot run off-center box perturbations."
+                )
+            self.gym.apply_rigid_body_force_at_pos_tensors(
+                self.sim,
+                forceTensor=gymtorch.unwrap_tensor(self.box_perturb_force_tensor),
+                posTensor=gymtorch.unwrap_tensor(self.box_perturb_force_pos_tensor),
+                space=gymapi.CoordinateSpace.ENV_SPACE,
+            )
+        else:
+            # The rigid-body force tensor API acts at each body COM and supplies no torque.
+            self.gym.apply_rigid_body_force_tensors(
+                self.sim,
+                forceTensor=gymtorch.unwrap_tensor(self.box_perturb_force_tensor),
+                space=gymapi.CoordinateSpace.ENV_SPACE,
+            )
 
         if torch.any(active):
             self.box_perturb_elapsed_physics_steps[active] += 1
             self.box_perturb_remaining_physics_steps[active] -= 1
+
+    def _pulse_profile_scale(self, tau_fraction, profile_ids):
+        half_sine = torch.sin(math.pi * torch.clamp(tau_fraction, 0.0, 1.0))
+        scale = half_sine.clone()
+        ramp_mask = profile_ids == self._PULSE_PROFILE_IDS["ramp_hold"]
+        if torch.any(ramp_mask):
+            tau = torch.clamp(tau_fraction[ramp_mask], 0.0, 1.0)
+            scale[ramp_mask] = torch.clamp(tau / 0.25, max=1.0)
+        multi_mask = profile_ids == self._PULSE_PROFILE_IDS["multi_pulse"]
+        if torch.any(multi_mask):
+            tau = torch.clamp(tau_fraction[multi_mask], 0.0, 1.0)
+            envelope = torch.sin(math.pi * tau)
+            ripple = 0.65 + 0.35 * torch.abs(torch.sin(5.0 * math.pi * tau))
+            scale[multi_mask] = envelope * ripple
+        jitter_mask = profile_ids == self._PULSE_PROFILE_IDS["jittered_half_sine"]
+        if torch.any(jitter_mask):
+            amp = float(getattr(self.cfg.box_perturbation, "jittered_half_sine_amplitude", 0.15))
+            noise = 1.0 + amp * (2.0 * torch.rand_like(scale[jitter_mask]) - 1.0)
+            scale[jitter_mask] = torch.clamp(half_sine[jitter_mask] * noise, min=0.0)
+        return scale
 
     def _update_carry_phase(self):
         # Base post_physics_step calls this after refreshing state/contact tensors.
@@ -203,11 +272,20 @@ class LeggedRobot(CarryBox):
     def _clear_box_perturbation_state_for_gate(self):
         """Make runtime gate-off transitions immediate and free of force leakage."""
         self.box_perturb_force_tensor.zero_()
+        self.box_perturb_force_pos_tensor.zero_()
         self.box_perturb_peak_force_world.zero_()
         self.box_perturb_direction_world.zero_()
+        self.box_perturb_force_point_box.zero_()
+        self.box_perturb_force_point_world.zero_()
+        self.box_perturb_external_torque_world.zero_()
         self.box_perturb_peak_force_N.zero_()
+        self.box_perturb_force_peak_cap_N.fill_(float("nan"))
         self.box_perturb_beta.zero_()
         self.box_perturb_mass_kg.zero_()
+        self.box_perturb_actual_force_scale.zero_()
+        self.box_perturb_pulse_steps.zero_()
+        self.box_perturb_pulse_duration_s.zero_()
+        self.box_perturb_pulse_profile_id_buf.zero_()
         self.box_perturb_elapsed_physics_steps.zero_()
         self.box_perturb_remaining_physics_steps.zero_()
         self.confirmed_carry_streak.zero_()
@@ -326,7 +404,114 @@ class LeggedRobot(CarryBox):
             and self.num_envs == 1
         )
 
-    def schedule_explicit_box_perturbation(self, direction_name, beta, env_id=0):
+    def set_evaluation_long_range_goal(
+        self,
+        distance_range=(4.0, 8.0),
+        bearing_offset_deg=(15.0, 75.0),
+        env_id=0,
+    ):
+        """Evaluation-only replacement goal sampler; does not alter training reset."""
+        env_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
+        min_distance, max_distance = [float(value) for value in distance_range]
+        min_bearing, max_bearing = [float(value) for value in bearing_offset_deg]
+        if not (0.0 < min_distance <= max_distance):
+            raise ValueError(f"Invalid goal distance range: {distance_range}")
+        if not (0.0 <= min_bearing <= max_bearing <= 180.0):
+            raise ValueError(f"Invalid goal bearing range: {bearing_offset_deg}")
+
+        box_to_robot = self.root_states[env_ids, 0:2] - self.box_states[env_ids, 0:2]
+        base_angle = torch.atan2(box_to_robot[:, 1], box_to_robot[:, 0])
+        bearing = min_bearing + (max_bearing - min_bearing) * torch.rand(
+            len(env_ids), device=self.device
+        )
+        sign = torch.where(
+            torch.rand(len(env_ids), device=self.device) < 0.5,
+            -torch.ones(len(env_ids), device=self.device),
+            torch.ones(len(env_ids), device=self.device),
+        )
+        final_angle = base_angle + sign * bearing * (math.pi / 180.0)
+        distance = min_distance + (max_distance - min_distance) * torch.rand(
+            len(env_ids), device=self.device
+        )
+        goal_xy = self.box_states[env_ids, 0:2] + distance.unsqueeze(-1) * torch.stack(
+            (torch.cos(final_angle), torch.sin(final_angle)), dim=-1
+        )
+        self.goal_pos[env_ids, 0:2] = goal_xy
+        self.goal_pos[env_ids, 2] = (
+            self.env_origins[env_ids, 2] + float(self.cfg.rewards.target_box_height)
+        )
+        yaw = torch.rand(len(env_ids), device=self.device) * 2.0 * math.pi
+        self.goal_rot[env_ids] = quat_from_angle_axis(
+            yaw, self.z_axis_unit.expand(len(env_ids), -1)
+        )
+        self.tar_platform_pos[env_ids, 0:2] = goal_xy
+        self.tar_platform_pos[env_ids, 2] = (
+            self.env_origins[env_ids, 2] + 0.5 * self._platform_height
+        )
+        self.robot2goal_dir = self.goal_pos[:, :2] - self.root_states[:, :2]
+        self.robot2goal_dist = torch.norm(self.robot2goal_dir, dim=-1)
+        self.object2goal_pos = self.box_states[:, :3] - self.goal_pos
+        self.object2goal_dist_xy = torch.norm(self.object2goal_pos[:, :2], dim=-1)
+        self.object2goal_dist_xyz = torch.norm(self.object2goal_pos, dim=-1)
+        self.compute_observations()
+        return float(distance[0].item())
+
+    def resolve_force_point_box(self, direction_name, force_point_mode="com", force_point_label="com", env_id=0):
+        """Return a box-local force application offset for evaluation sweeps."""
+        mode = str(force_point_mode or "com")
+        label = str(force_point_label or "com")
+        if mode == "com" or label == "com":
+            return torch.zeros(3, device=self.device), "com"
+        half = 0.5 * self._box_size[env_id].detach()
+        direction_local = torch.zeros(3, device=self.device)
+        if direction_name.endswith("z_world"):
+            world = torch.tensor(
+                [0.0, 0.0, 1.0 if direction_name[0] == "+" else -1.0],
+                device=self.device,
+            ).unsqueeze(0)
+            direction_local = quat_rotate_inverse(
+                self.box_states[env_id, 3:7].unsqueeze(0), world
+            )[0]
+        else:
+            component = 0 if direction_name[-1] == "x" else 1
+            direction_local[component] = 1.0 if direction_name[0] == "+" else -1.0
+        normal_axis = int(torch.argmax(torch.abs(direction_local)).item())
+        normal_sign = -1.0 if float(direction_local[normal_axis].item()) >= 0.0 else 1.0
+        offset = torch.zeros(3, device=self.device)
+        offset[normal_axis] = normal_sign * half[normal_axis]
+        tangent_axes = [axis for axis in (0, 1, 2) if axis != normal_axis]
+        vertical_axis = 2 if 2 in tangent_axes else tangent_axes[1]
+        lateral_axis = tangent_axes[0] if tangent_axes[0] != vertical_axis else tangent_axes[1]
+        if mode == "box_surface_random":
+            for axis in tangent_axes:
+                offset[axis] = (2.0 * torch.rand((), device=self.device) - 1.0) * 0.8 * half[axis]
+            return offset, "random"
+        if mode != "box_surface_grid":
+            raise ValueError(f"Unknown force_point_mode: {mode}")
+        if label == "face_center":
+            pass
+        elif label == "face_upper":
+            offset[vertical_axis] = 0.5 * half[vertical_axis]
+        elif label == "face_lower":
+            offset[vertical_axis] = -0.5 * half[vertical_axis]
+        elif label == "face_left_edge":
+            offset[lateral_axis] = -0.8 * half[lateral_axis]
+        elif label == "face_right_edge":
+            offset[lateral_axis] = 0.8 * half[lateral_axis]
+        else:
+            raise ValueError(f"Unknown force_point_label for grid mode: {label}")
+        return offset, label
+
+    def schedule_explicit_box_perturbation(
+        self,
+        direction_name,
+        beta,
+        env_id=0,
+        force_point_box=None,
+        pulse_duration_s=None,
+        pulse_profile=None,
+        force_peak_cap_N=None,
+    ):
         """Schedule a deterministic evaluation pulse after the confirmed-carry gate."""
         if direction_name not in self._DIRECTION_IDS:
             raise ValueError(f"Unknown perturbation direction: {direction_name}")
@@ -366,12 +551,20 @@ class LeggedRobot(CarryBox):
             beta_tensor,
             direction_ids,
             f"evaluation:{direction_name}",
+            force_point_box=force_point_box,
+            pulse_duration_s=pulse_duration_s,
+            pulse_profile=pulse_profile,
+            force_peak_cap_N=force_peak_cap_N,
         )
         world = self.box_perturb_direction_world[env_id].detach().cpu().tolist()
+        point = self.box_perturb_force_point_box[env_id].detach().cpu().tolist()
         print(
             "[BoxPerturb] "
             f"direction={direction_name} "
             f"world_direction=({world[0]:+.4f},{world[1]:+.4f},{world[2]:+.4f}) "
+            f"point_box=({point[0]:+.3f},{point[1]:+.3f},{point[2]:+.3f}) "
+            f"profile={self._PULSE_PROFILE_NAMES[int(self.box_perturb_pulse_profile_id_buf[env_id].item())]} "
+            f"duration={float(self.box_perturb_pulse_duration_s[env_id].item()):.3f}s "
             f"peak={float(self.box_perturb_peak_force_N[env_id].item()):.4f}N"
         )
         return float(self.box_perturb_peak_force_N[env_id].item())
@@ -426,6 +619,10 @@ class LeggedRobot(CarryBox):
         left_index = int(self.left_hand_net_contact_force_index)
         right_index = int(self.right_hand_net_contact_force_index)
         f_ext = self.box_perturb_force_tensor[env_id, box_index].detach()
+        force_point_world = self.box_perturb_force_point_world[env_id].detach()
+        force_point_box = self.box_perturb_force_point_box[env_id].detach()
+        moment_arm_world = force_point_world - self.box_states[env_id, 0:3].detach()
+        external_torque_world = self.box_perturb_external_torque_world[env_id].detach()
         left_on_hand = self.contact_forces[env_id, left_index].detach()
         right_on_hand = self.contact_forces[env_id, right_index].detach()
         left_on_box = -left_on_hand
@@ -536,17 +733,28 @@ class LeggedRobot(CarryBox):
             "beta": float(self.box_perturb_beta[env_id].item()),
             "box_mass_kg": float(self.box_masses[env_id].item()),
             "force_peak_N": float(self.box_perturb_peak_force_N[env_id].item()),
+            "force_peak_cap_N": float(self.box_perturb_force_peak_cap_N[env_id].item()),
             "force_uncapped_peak_N": float(
                 self.box_perturb_beta[env_id].item() * self.box_masses[env_id].item() * 9.81
             ),
             "force_cap_used": int(self.box_perturb_cap_used_buf[env_id].item()),
             "force_impulse_Ns": self._trace_impulse_Ns,
+            "pulse_profile": self._PULSE_PROFILE_NAMES[
+                int(self.box_perturb_pulse_profile_id_buf[env_id].item())
+            ],
+            "pulse_duration_s": float(self.box_perturb_pulse_duration_s[env_id].item()),
+            "pulse_phase": (
+                float(self.box_perturb_elapsed_physics_steps[env_id].item())
+                / float(max(int(self.box_perturb_pulse_steps[env_id].item()), 1))
+            ),
+            "actual_force_scale": float(self.box_perturb_actual_force_scale[env_id].item()),
             "force_baseline_sample_count": self._trace_force_baseline_count,
             "force_baseline_unavailable": int(self._trace_force_baseline is None),
             "confirmed_streak_at_schedule": int(
                 self.box_perturb_schedule_confirmed_streak[env_id].item()
             ),
             "f_ext_norm_N": float(torch.linalg.vector_norm(f_ext).item()),
+            "external_torque_norm_Nm": float(torch.linalg.vector_norm(external_torque_world).item()),
             "left_hand_on_box_proxy_norm_N": float(left_norm.item()),
             "right_hand_on_box_proxy_norm_N": float(right_norm.item()),
             "combined_hand_on_box_proxy_norm_N": float(
@@ -585,6 +793,10 @@ class LeggedRobot(CarryBox):
                 torch.linalg.vector_norm(box_ang_vel).item()
             ),
             **vec("f_ext_world_N", f_ext),
+            **vec("force_point_box", force_point_box),
+            **vec("force_point_world", force_point_world),
+            **vec("moment_arm_world", moment_arm_world),
+            **vec("external_torque_world_Nm", external_torque_world),
             **vec("left_hand_net_contact_force_world_N", left_on_hand),
             **vec("right_hand_net_contact_force_world_N", right_on_hand),
             **vec("left_hand_on_box_proxy_world_N", left_on_box),
@@ -650,7 +862,16 @@ class LeggedRobot(CarryBox):
         )
 
     def _commit_box_perturbation(
-        self, env_ids, direction_world, beta, direction_ids, label
+        self,
+        env_ids,
+        direction_world,
+        beta,
+        direction_ids,
+        label,
+        force_point_box=None,
+        pulse_duration_s=None,
+        pulse_profile=None,
+        force_peak_cap_N=None,
     ):
         cfg = self.cfg.box_perturbation
         if bool(cfg.evaluation_mode):
@@ -663,26 +884,56 @@ class LeggedRobot(CarryBox):
                 )
         mass = self.box_masses[env_ids]
         uncapped_peak = beta * mass * 9.81
-        cap = cfg.force_peak_cap_N
+        cap = cfg.force_peak_cap_N if force_peak_cap_N is None else force_peak_cap_N
         if cap is None:
             peak = uncapped_peak
             cap_used = torch.zeros_like(peak, dtype=torch.bool)
+            cap_record = torch.full_like(peak, float("nan"))
         else:
             peak = torch.clamp(uncapped_peak, max=float(cap))
             cap_used = uncapped_peak > float(cap)
+            cap_record = torch.full_like(peak, float(cap))
+        duration = (
+            float(cfg.pulse_duration_s)
+            if pulse_duration_s is None
+            else float(pulse_duration_s)
+        )
+        profile_name = str(
+            getattr(cfg, "pulse_profile", "half_sine")
+            if pulse_profile is None
+            else pulse_profile
+        )
+        if profile_name not in self._PULSE_PROFILE_IDS:
+            raise ValueError(f"Unknown pulse profile: {profile_name}")
+        if force_point_box is None:
+            force_point_box_tensor = torch.zeros((env_ids.numel(), 3), device=self.device)
+        else:
+            force_point_box_tensor = torch.as_tensor(
+                force_point_box, dtype=torch.float, device=self.device
+            ).reshape(env_ids.numel(), 3)
+        pulse_steps = max(1, int(round(duration / float(self.sim_params.dt))))
 
         self.box_perturb_direction_world[env_ids] = direction_world
+        self.box_perturb_force_point_box[env_ids] = force_point_box_tensor
+        self.box_perturb_force_point_world[env_ids] = self.box_states[env_ids, 0:3] + quat_rotate(
+            self.box_states[env_ids, 3:7], force_point_box_tensor
+        )
         self.box_perturb_peak_force_N[env_ids] = peak
+        self.box_perturb_force_peak_cap_N[env_ids] = cap_record
         self.box_perturb_peak_force_world[env_ids] = direction_world * peak.unsqueeze(1)
         self.box_perturb_beta[env_ids] = beta
         self.box_perturb_mass_kg[env_ids] = mass
+        self.box_perturb_actual_force_scale[env_ids] = 0.0
+        self.box_perturb_pulse_steps[env_ids] = pulse_steps
+        self.box_perturb_pulse_duration_s[env_ids] = duration
+        self.box_perturb_pulse_profile_id_buf[env_ids] = self._PULSE_PROFILE_IDS[profile_name]
         self.box_perturb_cap_used_buf[env_ids] = cap_used
         self.box_perturb_direction_id_buf[env_ids] = direction_ids
         self.box_perturb_schedule_confirmed_streak[env_ids] = (
             self.confirmed_carry_streak[env_ids]
         )
         self.box_perturb_elapsed_physics_steps[env_ids] = 0
-        self.box_perturb_remaining_physics_steps[env_ids] = self._pulse_physics_steps()
+        self.box_perturb_remaining_physics_steps[env_ids] = pulse_steps
         self.box_perturb_event_count_buf[env_ids] += 1
         self.box_perturb_recovery_success_buf[env_ids] = False
         self.box_perturb_recovery_done_buf[env_ids] = False
@@ -765,7 +1016,10 @@ class LeggedRobot(CarryBox):
         had_event = self.box_perturb_event_count_buf > 0
         pulse_finished = (
             had_event
-            & (self.box_perturb_elapsed_physics_steps >= self._pulse_physics_steps())
+            & (
+                self.box_perturb_elapsed_physics_steps
+                >= torch.clamp(self.box_perturb_pulse_steps, min=1)
+            )
             & ~self.box_perturb_recovery_active_buf
             & ~self.box_perturb_recovery_done_buf
         )
@@ -857,17 +1111,26 @@ class LeggedRobot(CarryBox):
 
         for name in (
             "box_perturb_force_tensor",
+            "box_perturb_force_pos_tensor",
             "box_perturb_peak_force_world",
             "box_perturb_direction_world",
+            "box_perturb_force_point_box",
+            "box_perturb_force_point_world",
+            "box_perturb_external_torque_world",
         ):
             getattr(self, name)[env_ids] = 0.0
         for name in (
             "box_perturb_peak_force_N",
             "box_perturb_beta",
             "box_perturb_mass_kg",
+            "box_perturb_actual_force_scale",
+            "box_perturb_pulse_duration_s",
         ):
             getattr(self, name)[env_ids] = 0.0
+        self.box_perturb_force_peak_cap_N[env_ids] = float("nan")
         for name in (
+            "box_perturb_pulse_steps",
+            "box_perturb_pulse_profile_id_buf",
             "box_perturb_elapsed_physics_steps",
             "box_perturb_remaining_physics_steps",
             "confirmed_carry_streak",
@@ -969,7 +1232,7 @@ class LeggedRobot(CarryBox):
         }
 
     def _draw_debug_vis(self):
-        """Draw the latest commanded external force as an arrow at the box COM."""
+        """Draw the latest commanded external force at its actual force point."""
         super()._draw_debug_vis()
         cfg = self.cfg.box_perturbation
         if not bool(cfg.debug_draw_force):
@@ -989,7 +1252,7 @@ class LeggedRobot(CarryBox):
                 continue
 
             direction = force / magnitude
-            start = self.box_states[env_id, :3].detach().cpu().numpy()
+            start = self.box_perturb_force_point_world[env_id].detach().cpu().numpy()
             end = start + force * scale
 
             reference = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
