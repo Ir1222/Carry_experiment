@@ -120,7 +120,7 @@ def _configure_eval(env_cfg, parsed):
     perturb.enabled = True
     perturb.debug_force_event = False
     perturb.debug_sweep_enabled = False
-    perturb.debug_draw_force = False
+    perturb.debug_draw_force = bool(parsed.viewer)
     perturb.evaluation_mode = True
     perturb.evaluation_manual_schedule = True
     perturb.evaluation_trace_enabled = True

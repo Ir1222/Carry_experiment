@@ -81,6 +81,8 @@ class G1Cfg(CarryBoxResumeCfg):
         # Viewer arrow length is |F| times this scale.
         debug_force_draw_scale_m_per_N = 0.14
         debug_force_arrow_head_length_m = 0.18
+        debug_force_arrow_shaft_width_m = 0.035
+        debug_force_point_marker_size_m = 0.08
         debug_force_draw_max_envs = 10
         debug_force_log_interval_policy_steps = 1
 

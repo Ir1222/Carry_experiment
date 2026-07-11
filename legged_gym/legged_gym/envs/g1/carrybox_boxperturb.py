@@ -1232,8 +1232,14 @@ class LeggedRobot(CarryBox):
         }
 
     def _draw_debug_vis(self):
-        """Draw the latest commanded external force at its actual force point."""
-        super()._draw_debug_vis()
+        """Draw only the latest commanded external force at its actual force point.
+
+        The CarryBox parent draws red/green/blue box-local XYZ axes.  For
+        perturbation debugging those axes are visually misleading, so this
+        override clears all viewer lines and draws a single thick orange force
+        arrow whose tail is the actual force application point.
+        """
+        self.gym.clear_lines(self.viewer)
         cfg = self.cfg.box_perturbation
         if not bool(cfg.debug_draw_force):
             return
@@ -1242,8 +1248,11 @@ class LeggedRobot(CarryBox):
             :, int(self.box_net_contact_force_index), :
         ]
         scale = float(cfg.debug_force_draw_scale_m_per_N)
+        shaft_width = float(getattr(cfg, "debug_force_arrow_shaft_width_m", 0.035))
+        marker_size = float(getattr(cfg, "debug_force_point_marker_size_m", 0.08))
         max_envs = min(self.num_envs, int(cfg.debug_force_draw_max_envs))
         color = np.asarray([1.0, 0.25, 0.0], dtype=np.float32)
+        point_color = np.asarray([1.0, 0.95, 0.0], dtype=np.float32)
 
         for env_id in range(max_envs):
             force = applied[env_id].detach().cpu().numpy()
@@ -1260,25 +1269,72 @@ class LeggedRobot(CarryBox):
                 reference = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
             side = np.cross(direction, reference)
             side /= max(float(np.linalg.norm(side)), 1.0e-6)
+            up = np.cross(direction, side)
+            up /= max(float(np.linalg.norm(up)), 1.0e-6)
 
             shaft_length = magnitude * scale
             head_length = min(
                 float(cfg.debug_force_arrow_head_length_m),
                 max(0.25 * shaft_length, 0.01),
             )
-            head_width = 0.5 * head_length
+            head_width = max(0.65 * head_length, 1.6 * shaft_width)
             head_base = end - direction * head_length
-            left = head_base + side * head_width
-            right = head_base - side * head_width
 
-            vertices = np.stack(
-                (start, end, end, left, end, right), axis=0
-            ).astype(np.float32).reshape(3, 6)
-            colors = np.repeat(color.reshape(1, 3), 3, axis=0)
+            line_segments = []
+
+            # A bundle of parallel shaft lines makes the arrow appear thick in
+            # Isaac Gym's fixed-width line renderer.
+            shaft_offsets = (
+                np.asarray([0.0, 0.0], dtype=np.float32),
+                np.asarray([1.0, 0.0], dtype=np.float32),
+                np.asarray([-1.0, 0.0], dtype=np.float32),
+                np.asarray([0.0, 1.0], dtype=np.float32),
+                np.asarray([0.0, -1.0], dtype=np.float32),
+                np.asarray([0.7, 0.7], dtype=np.float32),
+                np.asarray([0.7, -0.7], dtype=np.float32),
+                np.asarray([-0.7, 0.7], dtype=np.float32),
+                np.asarray([-0.7, -0.7], dtype=np.float32),
+            )
+            for offset in shaft_offsets:
+                delta = shaft_width * (offset[0] * side + offset[1] * up)
+                line_segments.append((start + delta, end + delta))
+
+            # Arrow head in both perpendicular planes so the direction is
+            # visible regardless of camera angle.
+            for basis in (side, up):
+                line_segments.append((end, head_base + basis * head_width))
+                line_segments.append((end, head_base - basis * head_width))
+            for sign_side in (-1.0, 1.0):
+                for sign_up in (-1.0, 1.0):
+                    line_segments.append(
+                        (end, head_base + sign_side * side * head_width * 0.7 + sign_up * up * head_width * 0.7)
+                    )
+
+            vertices = np.asarray(
+                [[*a, *b] for a, b in line_segments], dtype=np.float32
+            )
+            colors = np.repeat(color.reshape(1, 3), len(line_segments), axis=0)
             self.gym.add_lines(
                 self.viewer,
                 self.envs[env_id],
-                3,
+                len(line_segments),
                 vertices,
                 colors,
+            )
+
+            marker_segments = [
+                (start - side * marker_size, start + side * marker_size),
+                (start - up * marker_size, start + up * marker_size),
+                (start - direction * marker_size, start + direction * marker_size),
+            ]
+            marker_vertices = np.asarray(
+                [[*a, *b] for a, b in marker_segments], dtype=np.float32
+            )
+            marker_colors = np.repeat(point_color.reshape(1, 3), len(marker_segments), axis=0)
+            self.gym.add_lines(
+                self.viewer,
+                self.envs[env_id],
+                len(marker_segments),
+                marker_vertices,
+                marker_colors,
             )
