@@ -1305,8 +1305,8 @@ class LeggedRobot(CarryBox):
 
         The CarryBox parent draws red/green/blue box-local XYZ axes.  For
         perturbation debugging those axes are visually misleading, so this
-        override clears all viewer lines and draws a single thick orange force
-        arrow whose tail is the actual force application point.
+        override clears all viewer lines and draws a FALCON-style red force
+        bundle whose tail is the actual force application point.
         """
         self.gym.clear_lines(self.viewer)
         cfg = self.cfg.box_perturbation
@@ -1345,11 +1345,10 @@ class LeggedRobot(CarryBox):
                 self.box_perturb_debug_draw_hold_steps - 1, min=0
             )
         scale = float(cfg.debug_force_draw_scale_m_per_N)
-        shaft_width = float(getattr(cfg, "debug_force_arrow_shaft_width_m", 0.035))
-        marker_size = float(getattr(cfg, "debug_force_point_marker_size_m", 0.08))
+        line_count = max(1, int(cfg.debug_force_bundle_line_count))
+        jitter = max(0.0, float(cfg.debug_force_bundle_jitter_m))
         max_envs = min(self.num_envs, int(cfg.debug_force_draw_max_envs))
-        color = np.asarray([1.0, 0.25, 0.0], dtype=np.float32)
-        point_color = np.asarray([1.0, 0.95, 0.0], dtype=np.float32)
+        color = np.asarray([0.851, 0.144, 0.07], dtype=np.float32)
 
         for env_id in range(max_envs):
             force = draw_force[env_id].detach().cpu().numpy()
@@ -1357,81 +1356,21 @@ class LeggedRobot(CarryBox):
             if magnitude <= 1.0e-6:
                 continue
 
-            direction = force / magnitude
             start = draw_point[env_id].detach().cpu().numpy()
             end = start + force * scale
 
-            reference = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-            if abs(float(np.dot(direction, reference))) > 0.9:
-                reference = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
-            side = np.cross(direction, reference)
-            side /= max(float(np.linalg.norm(side)), 1.0e-6)
-            up = np.cross(direction, side)
-            up /= max(float(np.linalg.norm(up)), 1.0e-6)
-
-            shaft_length = magnitude * scale
-            head_length = min(
-                float(cfg.debug_force_arrow_head_length_m),
-                max(0.25 * shaft_length, 0.01),
-            )
-            head_width = max(0.65 * head_length, 1.6 * shaft_width)
-            head_base = end - direction * head_length
-
-            line_segments = []
-
-            # A bundle of parallel shaft lines makes the arrow appear thick in
-            # Isaac Gym's fixed-width line renderer.
-            shaft_offsets = (
-                np.asarray([0.0, 0.0], dtype=np.float32),
-                np.asarray([1.0, 0.0], dtype=np.float32),
-                np.asarray([-1.0, 0.0], dtype=np.float32),
-                np.asarray([0.0, 1.0], dtype=np.float32),
-                np.asarray([0.0, -1.0], dtype=np.float32),
-                np.asarray([0.7, 0.7], dtype=np.float32),
-                np.asarray([0.7, -0.7], dtype=np.float32),
-                np.asarray([-0.7, 0.7], dtype=np.float32),
-                np.asarray([-0.7, -0.7], dtype=np.float32),
-            )
-            for offset in shaft_offsets:
-                delta = shaft_width * (offset[0] * side + offset[1] * up)
-                line_segments.append((start + delta, end + delta))
-
-            # Arrow head in both perpendicular planes so the direction is
-            # visible regardless of camera angle.
-            for basis in (side, up):
-                line_segments.append((end, head_base + basis * head_width))
-                line_segments.append((end, head_base - basis * head_width))
-            for sign_side in (-1.0, 1.0):
-                for sign_up in (-1.0, 1.0):
-                    line_segments.append(
-                        (end, head_base + sign_side * side * head_width * 0.7 + sign_up * up * head_width * 0.7)
-                    )
-
-            vertices = np.asarray(
-                [[*a, *b] for a, b in line_segments], dtype=np.float32
-            )
-            colors = np.repeat(color.reshape(1, 3), len(line_segments), axis=0)
+            # Match FALCON's force visualization: a small randomly jittered
+            # bundle gives Isaac Gym's fixed-width lines a thick, lively look.
+            start_jitter = np.random.random((line_count, 3)).astype(np.float32) * jitter
+            end_jitter = np.random.random((line_count, 3)).astype(np.float32) * jitter
+            starts = np.repeat(start.reshape(1, 3), line_count, axis=0) + start_jitter
+            ends = np.repeat(end.reshape(1, 3), line_count, axis=0) + end_jitter
+            vertices = np.concatenate((starts, ends), axis=1).astype(np.float32)
+            colors = np.repeat(color.reshape(1, 3), line_count, axis=0)
             self.gym.add_lines(
                 self.viewer,
                 self.envs[env_id],
-                len(line_segments),
+                line_count,
                 vertices,
                 colors,
-            )
-
-            marker_segments = [
-                (start - side * marker_size, start + side * marker_size),
-                (start - up * marker_size, start + up * marker_size),
-                (start - direction * marker_size, start + direction * marker_size),
-            ]
-            marker_vertices = np.asarray(
-                [[*a, *b] for a, b in marker_segments], dtype=np.float32
-            )
-            marker_colors = np.repeat(point_color.reshape(1, 3), len(marker_segments), axis=0)
-            self.gym.add_lines(
-                self.viewer,
-                self.envs[env_id],
-                len(marker_segments),
-                marker_vertices,
-                marker_colors,
             )

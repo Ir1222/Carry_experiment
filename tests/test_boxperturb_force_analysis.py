@@ -173,6 +173,25 @@ def test_six_direction_registry_and_observation_dimensions_are_unchanged():
     assert "force = peak_force_world * profile.unsqueeze(1)" in perturb_source
 
 
+def test_debug_force_visualization_matches_falcon_bundle_style():
+    perturb_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
+    config_source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb_resume_config.py").read_text()
+    draw_block = perturb_source.split("    def _draw_debug_vis(self):", 1)[1]
+
+    assert "debug_force_draw_scale_m_per_N = 0.025" in config_source
+    assert "debug_force_bundle_line_count = 20" in config_source
+    assert "debug_force_bundle_jitter_m = 0.02" in config_source
+    assert "[0.851, 0.144, 0.07]" in draw_block
+    assert "start = draw_point[env_id]" in draw_block
+    assert "end = start + force * scale" in draw_block
+    assert "np.random.random((line_count, 3))" in draw_block
+    assert "debug_force_arrow_head_length_m" not in config_source
+    assert "debug_force_arrow_shaft_width_m" not in config_source
+    assert "debug_force_point_marker_size_m" not in config_source
+    assert "head_base" not in draw_block
+    assert "marker_segments" not in draw_block
+
+
 def test_perturb_termination_does_not_require_disabled_long_range_buffers():
     source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
     check_block = source.split("    def check_termination(self):", 1)[1].split(

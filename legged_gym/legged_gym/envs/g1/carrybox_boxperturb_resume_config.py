@@ -79,10 +79,9 @@ class G1Cfg(CarryBoxResumeCfg):
         debug_force_event = False
         debug_draw_force = False
         # Viewer arrow length is |F| times this scale.
-        debug_force_draw_scale_m_per_N = 0.14
-        debug_force_arrow_head_length_m = 0.18
-        debug_force_arrow_shaft_width_m = 0.035
-        debug_force_point_marker_size_m = 0.08
+        debug_force_draw_scale_m_per_N = 0.025
+        debug_force_bundle_line_count = 20
+        debug_force_bundle_jitter_m = 0.02
         # Viewer-only persistence after the physical pulse ends.  This does
         # not change applied force, trace, reward, or termination.
         debug_force_arrow_hold_s = 1.25
