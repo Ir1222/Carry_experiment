@@ -187,7 +187,10 @@ class LeggedRobot(CarryBox):
             self.box_perturb_peak_force_world[active] = peak_force_world
             self.box_perturb_actual_force_scale[active] = profile
             self.box_perturb_debug_draw_point_box[active] = self.box_perturb_force_point_box[active]
-            self.box_perturb_debug_draw_force_N[active] = torch.linalg.vector_norm(force, dim=-1)
+            current_force_N = torch.linalg.vector_norm(force, dim=-1)
+            self.box_perturb_debug_draw_force_N[active] = torch.maximum(
+                self.box_perturb_debug_draw_force_N[active], current_force_N
+            )
             self.box_perturb_debug_draw_world_z[active] = self.box_perturb_direction_is_world[active]
             self.box_perturb_debug_draw_direction_local[active] = self.box_perturb_direction_local[active]
             hold_steps = max(
@@ -987,6 +990,9 @@ class LeggedRobot(CarryBox):
         self.box_perturb_beta[env_ids] = beta
         self.box_perturb_mass_kg[env_ids] = mass
         self.box_perturb_actual_force_scale[env_ids] = 0.0
+        # Start a fresh viewer-only peak tracker for this perturbation.  The
+        # physical force tensor and evaluation trace remain instantaneous.
+        self.box_perturb_debug_draw_force_N[env_ids] = 0.0
         self.box_perturb_pulse_steps[env_ids] = pulse_steps
         self.box_perturb_pulse_duration_s[env_ids] = duration
         self.box_perturb_pulse_profile_id_buf[env_ids] = self._PULSE_PROFILE_IDS[profile_name]
