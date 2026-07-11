@@ -83,6 +83,9 @@ class G1Cfg(CarryBoxResumeCfg):
         debug_force_arrow_head_length_m = 0.18
         debug_force_arrow_shaft_width_m = 0.035
         debug_force_point_marker_size_m = 0.08
+        # Viewer-only persistence after the physical pulse ends.  This does
+        # not change applied force, trace, reward, or termination.
+        debug_force_arrow_hold_s = 1.25
         debug_force_draw_max_envs = 10
         debug_force_log_interval_policy_steps = 1
 

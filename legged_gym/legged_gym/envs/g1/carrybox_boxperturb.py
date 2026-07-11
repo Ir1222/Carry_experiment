@@ -46,6 +46,9 @@ class LeggedRobot(CarryBox):
         self.box_perturb_force_point_box = torch.zeros((n, 3), device=device)
         self.box_perturb_force_point_world = torch.zeros((n, 3), device=device)
         self.box_perturb_external_torque_world = torch.zeros((n, 3), device=device)
+        self.box_perturb_debug_draw_force_world = torch.zeros((n, 3), device=device)
+        self.box_perturb_debug_draw_point_world = torch.zeros((n, 3), device=device)
+        self.box_perturb_debug_draw_hold_steps = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_peak_force_N = torch.zeros(n, device=device)
         self.box_perturb_force_peak_cap_N = torch.full((n,), float("nan"), device=device)
         self.box_perturb_beta = torch.zeros(n, device=device)
@@ -175,6 +178,18 @@ class LeggedRobot(CarryBox):
                 point_offset_world, force, dim=-1
             )
             self.box_perturb_actual_force_scale[active] = profile
+            self.box_perturb_debug_draw_force_world[active] = force
+            self.box_perturb_debug_draw_point_world[active] = point_world
+            hold_steps = max(
+                1,
+                int(
+                    round(
+                        float(getattr(self.cfg.box_perturbation, "debug_force_arrow_hold_s", 1.25))
+                        / float(self.dt)
+                    )
+                ),
+            )
+            self.box_perturb_debug_draw_hold_steps[active] = hold_steps
 
         offset_norm = torch.linalg.vector_norm(self.box_perturb_force_point_box, dim=-1)
         use_force_at_pos = torch.any(active & (offset_norm > 1.0e-6))
@@ -278,6 +293,9 @@ class LeggedRobot(CarryBox):
         self.box_perturb_force_point_box.zero_()
         self.box_perturb_force_point_world.zero_()
         self.box_perturb_external_torque_world.zero_()
+        self.box_perturb_debug_draw_force_world.zero_()
+        self.box_perturb_debug_draw_point_world.zero_()
+        self.box_perturb_debug_draw_hold_steps.zero_()
         self.box_perturb_peak_force_N.zero_()
         self.box_perturb_force_peak_cap_N.fill_(float("nan"))
         self.box_perturb_beta.zero_()
@@ -1117,6 +1135,8 @@ class LeggedRobot(CarryBox):
             "box_perturb_force_point_box",
             "box_perturb_force_point_world",
             "box_perturb_external_torque_world",
+            "box_perturb_debug_draw_force_world",
+            "box_perturb_debug_draw_point_world",
         ):
             getattr(self, name)[env_ids] = 0.0
         for name in (
@@ -1131,6 +1151,7 @@ class LeggedRobot(CarryBox):
         for name in (
             "box_perturb_pulse_steps",
             "box_perturb_pulse_profile_id_buf",
+            "box_perturb_debug_draw_hold_steps",
             "box_perturb_elapsed_physics_steps",
             "box_perturb_remaining_physics_steps",
             "confirmed_carry_streak",
@@ -1247,6 +1268,16 @@ class LeggedRobot(CarryBox):
         applied = self.box_perturb_force_tensor[
             :, int(self.box_net_contact_force_index), :
         ]
+        draw_force = applied.clone()
+        draw_point = self.box_perturb_force_point_world.clone()
+        live = torch.linalg.vector_norm(draw_force, dim=-1) > 1.0e-6
+        held = (~live) & (self.box_perturb_debug_draw_hold_steps > 0)
+        draw_force[held] = self.box_perturb_debug_draw_force_world[held]
+        draw_point[held] = self.box_perturb_debug_draw_point_world[held]
+        if torch.any(self.box_perturb_debug_draw_hold_steps > 0):
+            self.box_perturb_debug_draw_hold_steps = torch.clamp(
+                self.box_perturb_debug_draw_hold_steps - 1, min=0
+            )
         scale = float(cfg.debug_force_draw_scale_m_per_N)
         shaft_width = float(getattr(cfg, "debug_force_arrow_shaft_width_m", 0.035))
         marker_size = float(getattr(cfg, "debug_force_point_marker_size_m", 0.08))
@@ -1255,13 +1286,13 @@ class LeggedRobot(CarryBox):
         point_color = np.asarray([1.0, 0.95, 0.0], dtype=np.float32)
 
         for env_id in range(max_envs):
-            force = applied[env_id].detach().cpu().numpy()
+            force = draw_force[env_id].detach().cpu().numpy()
             magnitude = float(np.linalg.norm(force))
             if magnitude <= 1.0e-6:
                 continue
 
             direction = force / magnitude
-            start = self.box_perturb_force_point_world[env_id].detach().cpu().numpy()
+            start = draw_point[env_id].detach().cpu().numpy()
             end = start + force * scale
 
             reference = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
