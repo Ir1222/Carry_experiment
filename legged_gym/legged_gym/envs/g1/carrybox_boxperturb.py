@@ -46,8 +46,10 @@ class LeggedRobot(CarryBox):
         self.box_perturb_force_point_box = torch.zeros((n, 3), device=device)
         self.box_perturb_force_point_world = torch.zeros((n, 3), device=device)
         self.box_perturb_external_torque_world = torch.zeros((n, 3), device=device)
-        self.box_perturb_debug_draw_force_world = torch.zeros((n, 3), device=device)
-        self.box_perturb_debug_draw_point_world = torch.zeros((n, 3), device=device)
+        self.box_perturb_debug_draw_direction_local = torch.zeros((n, 3), device=device)
+        self.box_perturb_debug_draw_point_box = torch.zeros((n, 3), device=device)
+        self.box_perturb_debug_draw_force_N = torch.zeros(n, device=device)
+        self.box_perturb_debug_draw_world_z = torch.zeros(n, dtype=torch.bool, device=device)
         self.box_perturb_debug_draw_hold_steps = torch.zeros(n, dtype=torch.long, device=device)
         self.box_perturb_peak_force_N = torch.zeros(n, device=device)
         self.box_perturb_force_peak_cap_N = torch.full((n,), float("nan"), device=device)
@@ -178,8 +180,19 @@ class LeggedRobot(CarryBox):
                 point_offset_world, force, dim=-1
             )
             self.box_perturb_actual_force_scale[active] = profile
-            self.box_perturb_debug_draw_force_world[active] = force
-            self.box_perturb_debug_draw_point_world[active] = point_world
+            self.box_perturb_debug_draw_point_box[active] = self.box_perturb_force_point_box[active]
+            self.box_perturb_debug_draw_force_N[active] = torch.linalg.vector_norm(force, dim=-1)
+            self.box_perturb_debug_draw_world_z[active] = torch.abs(
+                self.box_perturb_direction_world[active, 2]
+            ) > 0.999
+            local_direction = quat_rotate_inverse(
+                self.box_states[active, 3:7], self.box_perturb_direction_world[active]
+            )
+            self.box_perturb_debug_draw_direction_local[active] = torch.where(
+                self.box_perturb_debug_draw_world_z[active].unsqueeze(-1),
+                self.box_perturb_direction_world[active],
+                local_direction,
+            )
             hold_steps = max(
                 1,
                 int(
@@ -293,8 +306,10 @@ class LeggedRobot(CarryBox):
         self.box_perturb_force_point_box.zero_()
         self.box_perturb_force_point_world.zero_()
         self.box_perturb_external_torque_world.zero_()
-        self.box_perturb_debug_draw_force_world.zero_()
-        self.box_perturb_debug_draw_point_world.zero_()
+        self.box_perturb_debug_draw_direction_local.zero_()
+        self.box_perturb_debug_draw_point_box.zero_()
+        self.box_perturb_debug_draw_force_N.zero_()
+        self.box_perturb_debug_draw_world_z.zero_()
         self.box_perturb_debug_draw_hold_steps.zero_()
         self.box_perturb_peak_force_N.zero_()
         self.box_perturb_force_peak_cap_N.fill_(float("nan"))
@@ -1135,8 +1150,8 @@ class LeggedRobot(CarryBox):
             "box_perturb_force_point_box",
             "box_perturb_force_point_world",
             "box_perturb_external_torque_world",
-            "box_perturb_debug_draw_force_world",
-            "box_perturb_debug_draw_point_world",
+            "box_perturb_debug_draw_direction_local",
+            "box_perturb_debug_draw_point_box",
         ):
             getattr(self, name)[env_ids] = 0.0
         for name in (
@@ -1145,6 +1160,7 @@ class LeggedRobot(CarryBox):
             "box_perturb_mass_kg",
             "box_perturb_actual_force_scale",
             "box_perturb_pulse_duration_s",
+            "box_perturb_debug_draw_force_N",
         ):
             getattr(self, name)[env_ids] = 0.0
         self.box_perturb_force_peak_cap_N[env_ids] = float("nan")
@@ -1168,6 +1184,7 @@ class LeggedRobot(CarryBox):
             "box_perturb_recovery_active_buf",
             "box_perturb_recovery_success_buf",
             "box_perturb_recovery_done_buf",
+            "box_perturb_debug_draw_world_z",
         ):
             getattr(self, name)[env_ids] = False
         self.box_perturb_direction_id_buf[env_ids] = -1
@@ -1268,12 +1285,30 @@ class LeggedRobot(CarryBox):
         applied = self.box_perturb_force_tensor[
             :, int(self.box_net_contact_force_index), :
         ]
-        draw_force = applied.clone()
-        draw_point = self.box_perturb_force_point_world.clone()
-        live = torch.linalg.vector_norm(draw_force, dim=-1) > 1.0e-6
+        live = torch.linalg.vector_norm(applied, dim=-1) > 1.0e-6
         held = (~live) & (self.box_perturb_debug_draw_hold_steps > 0)
-        draw_force[held] = self.box_perturb_debug_draw_force_world[held]
-        draw_point[held] = self.box_perturb_debug_draw_point_world[held]
+        draw_force = torch.zeros_like(applied)
+        draw_point = self.box_states[:, 0:3].clone()
+        if torch.any(live):
+            draw_force[live] = applied[live]
+            draw_point[live] = self.box_perturb_force_point_world[live]
+        if torch.any(held):
+            held_direction = torch.zeros((int(held.sum().item()), 3), device=self.device)
+            held_ids = torch.nonzero(held, as_tuple=False).flatten()
+            world_z = self.box_perturb_debug_draw_world_z[held_ids]
+            if torch.any(world_z):
+                held_direction[world_z] = self.box_perturb_debug_draw_direction_local[held_ids[world_z]]
+            if torch.any(~world_z):
+                local = self.box_perturb_debug_draw_direction_local[held_ids[~world_z]]
+                held_direction[~world_z] = quat_rotate(self.box_states[held_ids[~world_z], 3:7], local)
+            held_direction = held_direction / torch.clamp(
+                torch.linalg.vector_norm(held_direction, dim=-1, keepdim=True),
+                min=1.0e-6,
+            )
+            draw_force[held_ids] = held_direction * self.box_perturb_debug_draw_force_N[held_ids].unsqueeze(-1)
+            draw_point[held_ids] = self.box_states[held_ids, 0:3] + quat_rotate(
+                self.box_states[held_ids, 3:7], self.box_perturb_debug_draw_point_box[held_ids]
+            )
         if torch.any(self.box_perturb_debug_draw_hold_steps > 0):
             self.box_perturb_debug_draw_hold_steps = torch.clamp(
                 self.box_perturb_debug_draw_hold_steps - 1, min=0
