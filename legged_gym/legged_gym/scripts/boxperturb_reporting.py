@@ -282,11 +282,14 @@ def write_analysis_workbook(output_dir, trials, summary, boundary):
     return True
 
 
-def write_run_files(output_dir, trials, traces, metadata, summary=None):
+def write_run_files(
+    output_dir, trials, traces, metadata, summary=None, write_force_trace=True
+):
     os.makedirs(output_dir, exist_ok=True)
     summary = summary or aggregate_trials(trials)
     boundary = build_boundary_rows(trials)
-    write_csv(os.path.join(output_dir, "force_trace.csv"), traces)
+    if write_force_trace:
+        write_csv(os.path.join(output_dir, "force_trace.csv"), traces)
     write_csv(os.path.join(output_dir, "trials.csv"), trials)
     write_csv(os.path.join(output_dir, "summary.csv"), summary)
     write_csv(os.path.join(output_dir, "boundary.csv"), boundary)

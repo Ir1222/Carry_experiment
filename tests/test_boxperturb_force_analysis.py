@@ -202,6 +202,13 @@ def test_boundary_evaluator_viewer_enables_force_visualization():
     assert 'parser.add_argument("--viewer", action="store_true", default=False)' in source
 
 
+def test_boundary_evaluator_none_force_cap_clears_config_default():
+    source = (ROOT / "legged_gym/legged_gym/scripts/evaluate_carrybox_boxperturb.py").read_text()
+
+    assert 'str(parsed.force_peak_cap_N).lower() == "none"' in source
+    assert "env.cfg.box_perturbation.force_peak_cap_N = None" in source
+
+
 def test_perturb_termination_does_not_require_disabled_long_range_buffers():
     source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
     check_block = source.split("    def check_termination(self):", 1)[1].split(

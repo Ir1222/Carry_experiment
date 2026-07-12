@@ -1,6 +1,8 @@
 import argparse
 import copy
 import csv
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -484,6 +486,113 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
+def _trial_identity(
+    model, direction, beta, point_mode, point_label, duration, profile, seed
+):
+    return [
+        str(model), str(direction), float(beta), str(point_mode), str(point_label),
+        float(duration), str(profile), int(seed),
+    ]
+
+
+def _trial_key(identity):
+    payload = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _atomic_write_json(path, value):
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, ensure_ascii=False, allow_nan=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def _load_progress_records(manifest_path):
+    if not os.path.isfile(manifest_path):
+        return []
+    records = []
+    malformed = False
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                malformed = True
+                print(
+                    f"[ResumeWarning] ignoring incomplete progress line "
+                    f"{line_number} in {manifest_path}"
+                )
+    if malformed:
+        temp_path = f"{manifest_path}.repair"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, allow_nan=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, manifest_path)
+    return records
+
+
+def _write_trace_part(path, trace):
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "wb") as raw_handle:
+        with gzip.GzipFile(fileobj=raw_handle, mode="wb", compresslevel=6) as handle:
+            for row in trace:
+                line = json.dumps(
+                    row, ensure_ascii=False, allow_nan=True, separators=(",", ":")
+                )
+                handle.write(line.encode("utf-8") + b"\n")
+        raw_handle.flush()
+        os.fsync(raw_handle.fileno())
+    os.replace(temp_path, path)
+
+
+def _append_progress_record(manifest_path, record):
+    with open(manifest_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, allow_nan=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _write_force_trace_csv_from_parts(output_path, progress_dir, records):
+    fields = []
+    seen = set()
+    trace_records = [record for record in records if record.get("trace_file")]
+    for record in trace_records:
+        path = os.path.join(progress_dir, record["trace_file"])
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            line = handle.readline()
+        if not line:
+            continue
+        for key in json.loads(line):
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    if not fields:
+        return 0
+
+    temp_path = f"{output_path}.tmp"
+    row_count = 0
+    with open(temp_path, "w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for record in trace_records:
+            path = os.path.join(progress_dir, record["trace_file"])
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        writer.writerow(json.loads(line))
+                        row_count += 1
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temp_path, output_path)
+    return row_count
+
+
 def _aggregate(trials):
     groups = defaultdict(list)
     for trial in trials:
@@ -693,43 +802,17 @@ def main(parsed):
         (parsed.interaction_label, parsed.interaction_checkpoint),
     )
     point_specs = _build_force_point_specs(parsed.force_point_modes, parsed.force_point_labels)
+    force_cap_disabled = (
+        parsed.force_peak_cap_N is not None
+        and str(parsed.force_peak_cap_N).lower() == "none"
+    )
     force_peak_cap_N = _parse_force_cap(
         parsed.force_peak_cap_N, env.cfg.box_perturbation.force_peak_cap_N
     )
-    trials = []
-    traces = []
-    for label, checkpoint in checkpoints:
-        resolved_path, _, _ = _load_actor_only(runner, checkpoint, env.device, label)
-        policy = runner.get_inference_policy(device=env.device)
-        for beta in parsed.betas:
-            for direction in parsed.directions:
-                for point_mode, point_label in point_specs:
-                    for pulse_duration_s in parsed.pulse_durations:
-                        for pulse_profile in parsed.pulse_profiles:
-                            for seed in parsed.seeds:
-                                trial, trace = _run_trial(
-                                    env,
-                                    policy,
-                                    label,
-                                    resolved_path,
-                                    seed,
-                                    direction,
-                                    beta,
-                                    point_mode,
-                                    point_label,
-                                    pulse_duration_s,
-                                    pulse_profile,
-                                    force_peak_cap_N,
-                                    parsed,
-                                    parsed.verbose_force_trace,
-                                )
-                                trials.append(trial)
-                                traces.extend(trace)
-
-    summary = _aggregate(trials)
-    comparison = _paired_comparison(
-        trials, parsed.baseline_label, parsed.interaction_label
-    )
+    if force_cap_disabled:
+        # schedule_explicit_box_perturbation uses the config value when its
+        # override is None, so clear both to make CLI "none" truly uncapped.
+        env.cfg.box_perturbation.force_peak_cap_N = None
     metadata = {
         "mode": "batch_ab", "checkpoints": {
             parsed.baseline_label: parsed.baseline_checkpoint,
@@ -754,7 +837,121 @@ def main(parsed):
         "force_sign_verification_samples": int(env.cfg.box_perturbation.force_sign_verification_samples),
         "force_closure_residual_max": float(env.cfg.box_perturbation.force_closure_residual_max),
     }
-    write_run_files(parsed.output_dir, trials, traces, metadata, summary)
+    run_signature = {
+        **metadata,
+        "baseline_label": parsed.baseline_label,
+        "interaction_label": parsed.interaction_label,
+        "eval_episode_length_s": float(parsed.eval_episode_length_s),
+        "eval_precondition_timeout_s": float(parsed.eval_precondition_timeout_s),
+    }
+    progress_dir = os.path.join(parsed.output_dir, "progress")
+    trace_parts_dir = os.path.join(progress_dir, "traces")
+    manifest_path = os.path.join(progress_dir, "trials.jsonl")
+    signature_path = os.path.join(progress_dir, "run_signature.json")
+    os.makedirs(trace_parts_dir, exist_ok=True)
+    if os.path.isfile(signature_path):
+        with open(signature_path, "r", encoding="utf-8") as handle:
+            previous_signature = json.load(handle)
+        if previous_signature != run_signature:
+            raise RuntimeError(
+                "Existing progress was created with different evaluation settings. "
+                "Use a new --output_dir or restore the original command."
+            )
+        if not parsed.resume_eval:
+            raise RuntimeError(
+                "Existing progress found. Add --resume_eval to continue, or use a new "
+                "--output_dir."
+            )
+    else:
+        _atomic_write_json(signature_path, run_signature)
+
+    records = _load_progress_records(manifest_path) if parsed.resume_eval else []
+    valid_records = []
+    for record in records:
+        trace_path = os.path.join(progress_dir, record.get("trace_file", ""))
+        if record.get("key") and os.path.isfile(trace_path):
+            valid_records.append(record)
+        else:
+            print(f"[ResumeWarning] incomplete trial ignored: {record.get('key')}")
+    records = valid_records
+    completed_keys = {record["key"] for record in records}
+    trials = [record["trial"] for record in records]
+    total_trials = (
+        len(checkpoints) * len(parsed.betas) * len(parsed.directions)
+        * len(point_specs) * len(parsed.pulse_durations)
+        * len(parsed.pulse_profiles) * len(parsed.seeds)
+    )
+    if completed_keys:
+        print(
+            f"[Resume] completed={len(completed_keys)}/{total_trials} "
+            f"output_dir={os.path.abspath(parsed.output_dir)}"
+        )
+    for label, checkpoint in checkpoints:
+        resolved_path, _, _ = _load_actor_only(runner, checkpoint, env.device, label)
+        policy = runner.get_inference_policy(device=env.device)
+        for beta in parsed.betas:
+            for direction in parsed.directions:
+                for point_mode, point_label in point_specs:
+                    for pulse_duration_s in parsed.pulse_durations:
+                        for pulse_profile in parsed.pulse_profiles:
+                            for seed in parsed.seeds:
+                                identity = _trial_identity(
+                                    label, direction, beta, point_mode, point_label,
+                                    pulse_duration_s, pulse_profile, seed,
+                                )
+                                key = _trial_key(identity)
+                                if key in completed_keys:
+                                    continue
+                                trial, trace = _run_trial(
+                                    env,
+                                    policy,
+                                    label,
+                                    resolved_path,
+                                    seed,
+                                    direction,
+                                    beta,
+                                    point_mode,
+                                    point_label,
+                                    pulse_duration_s,
+                                    pulse_profile,
+                                    force_peak_cap_N,
+                                    parsed,
+                                    parsed.verbose_force_trace,
+                                )
+                                trace_relative_path = os.path.join(
+                                    "traces", f"{key}.jsonl.gz"
+                                )
+                                _write_trace_part(
+                                    os.path.join(progress_dir, trace_relative_path), trace
+                                )
+                                record = {
+                                    "key": key,
+                                    "identity": identity,
+                                    "trace_file": trace_relative_path,
+                                    "trace_rows": len(trace),
+                                    "trial": trial,
+                                }
+                                _append_progress_record(manifest_path, record)
+                                records.append(record)
+                                completed_keys.add(key)
+                                trials.append(trial)
+                                print(
+                                    f"[Progress] completed={len(completed_keys)}/{total_trials} "
+                                    f"model={label} beta={beta} direction={direction} "
+                                    f"point={point_mode}:{point_label} duration={pulse_duration_s} "
+                                    f"profile={pulse_profile} seed={seed} trace_rows={len(trace)}"
+                                )
+
+    summary = _aggregate(trials)
+    comparison = _paired_comparison(
+        trials, parsed.baseline_label, parsed.interaction_label
+    )
+    trace_rows = _write_force_trace_csv_from_parts(
+        os.path.join(parsed.output_dir, "force_trace.csv"), progress_dir, records
+    )
+    write_run_files(
+        parsed.output_dir, trials, [], metadata, summary, write_force_trace=False
+    )
     with open(
         os.path.join(parsed.output_dir, "comparison.json"),
         "w",
@@ -765,7 +962,7 @@ def main(parsed):
         os.path.join(parsed.output_dir, "comparison.csv"), comparison["cells"]
     )
     print(
-        f"[ABComplete] trials={len(trials)} trace_rows={len(traces)} "
+        f"[ABComplete] trials={len(trials)} trace_rows={trace_rows} "
         f"output_dir={os.path.abspath(parsed.output_dir)}"
     )
 
@@ -794,4 +991,8 @@ if __name__ == "__main__":
     parser.add_argument("--sim_device", default="cuda:0")
     parser.add_argument("--viewer", action="store_true", default=False)
     parser.add_argument("--verbose_force_trace", action="store_true", default=False)
+    parser.add_argument(
+        "--resume_eval", action="store_true", default=False,
+        help="Resume a compatible interrupted evaluation from output_dir/progress.",
+    )
     main(parser.parse_args())
