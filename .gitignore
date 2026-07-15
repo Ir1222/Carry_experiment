@@ -66,6 +66,11 @@ legged_gym/legged_gym/scripts/plot*
 legged_gym/legged_gym/scripts/figure*
 legged_gym/legged_gym/scripts/wandb
 
+# Local generated artifacts (keep these directories out of Git)
+/logs/
+/output_dir/
+/outputs/
+
 isaacgym
 
 # other
