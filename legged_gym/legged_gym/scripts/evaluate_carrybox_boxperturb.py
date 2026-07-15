@@ -134,17 +134,18 @@ def _configure_eval(env_cfg, parsed):
     return env_cfg
 
 
-def _apply_eval_goal_if_requested(env, parsed):
+def _initial_goal_distance_after_reset(env, parsed):
+    """Read reset metadata without rebuilding or committing observations."""
     if parsed.eval_goal_mode == "default":
-        env.compute_observations()
         return 0.0
     if parsed.eval_goal_mode != "long_range":
         raise ValueError(f"Unknown eval goal mode: {parsed.eval_goal_mode}")
-    return env.set_evaluation_long_range_goal(
-        distance_range=tuple(parsed.eval_goal_distance_range),
-        bearing_offset_deg=tuple(parsed.eval_goal_bearing_offset_deg),
-        env_id=0,
-    )
+    distance = float(env.evaluation_initial_goal_distance_xy[0].item())
+    if not math.isfinite(distance):
+        raise RuntimeError(
+            "Long-range evaluation goal was not installed during env.reset()."
+        )
+    return distance
 
 
 def _set_trial_seed(seed):
@@ -153,6 +154,17 @@ def _set_trial_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _tensor_fingerprint(*tensors):
+    """Return a byte-exact fingerprint for reset-state comparability checks."""
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        value = tensor.detach().contiguous().cpu().numpy()
+        digest.update(str(value.shape).encode("ascii"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(value.tobytes())
+    return digest.hexdigest()[:20]
 
 
 def _load_actor_only(runner, checkpoint_path, device, label):
@@ -241,8 +253,14 @@ def _run_trial(
     cfg = env.cfg.box_perturbation
     _set_trial_seed(int(seed))
     obs, _ = env.reset()
-    initial_goal_distance = _apply_eval_goal_if_requested(env, parsed)
-    obs = env.get_observations()
+    initial_goal_distance = _initial_goal_distance_after_reset(env, parsed)
+    initial_physics_fingerprint = _tensor_fingerprint(
+        env.root_states[0], env.box_states[0], env.dof_pos[0], env.dof_vel[0]
+    )
+    initial_goal_fingerprint = _tensor_fingerprint(
+        env.goal_pos[0], env.goal_rot[0]
+    )
+    reset_actor_obs_fingerprint = _tensor_fingerprint(obs[0])
     force_point_box, resolved_point_label = env.resolve_force_point_box(
         direction, force_point_mode, force_point_label, env_id=0
     )
@@ -250,6 +268,10 @@ def _run_trial(
         "model": model_label,
         "checkpoint": checkpoint_path,
         "seed": int(seed),
+        "initialization_id": f"seed_{int(seed)}",
+        "initial_physics_fingerprint": initial_physics_fingerprint,
+        "initial_goal_fingerprint": initial_goal_fingerprint,
+        "reset_actor_obs_fingerprint": reset_actor_obs_fingerprint,
         "direction": direction,
         "requested_beta": float(beta),
         "force_point_mode": force_point_mode,
@@ -826,6 +848,10 @@ def main(parsed):
         "eval_goal_mode": parsed.eval_goal_mode,
         "eval_goal_distance_range": list(parsed.eval_goal_distance_range),
         "eval_goal_bearing_offset_deg": list(parsed.eval_goal_bearing_offset_deg),
+        "observation_history_initialization": (
+            env.EVALUATION_OBSERVATION_HISTORY_INITIALIZATION
+        ),
+        "initialization_protocol": "per_trial_seeded_reset_paired_by_seed",
         "coordinate_convention": {
             "box_xy": "box-local axes recomputed from the current box orientation every physics substep",
             "world_z": "gravity-aligned world axis", "force": "world-frame N", "impulse": "N s",

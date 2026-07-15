@@ -33,10 +33,20 @@ class LeggedRobot(CarryBox):
     }
     _PULSE_PROFILE_NAMES = {value: key for key, value in _PULSE_PROFILE_IDS.items()}
 
+    EVALUATION_OBSERVATION_HISTORY_INITIALIZATION = (
+        "goal_before_zero_action_single_commit"
+    )
+
     def _init_buffers(self):
         super()._init_buffers()
         n = self.num_envs
         device = self.device
+
+        # The sampled distance is recorded before the reset zero-action step so
+        # evaluator metadata does not need to rebuild/commit observations.
+        self.evaluation_initial_goal_distance_xy = torch.full(
+            (n,), float("nan"), device=device
+        )
 
         # This tensor is intentionally separate from the legacy robot disturbance.
         self.box_perturb_force_tensor = torch.zeros_like(self.disturbance)
@@ -452,14 +462,32 @@ class LeggedRobot(CarryBox):
             and self.num_envs == 1
         )
 
-    def set_evaluation_long_range_goal(
+    def _reset_task(self, env_ids):
+        """Install an evaluation goal before BaseTask.reset() takes its first step."""
+        super()._reset_task(env_ids)
+        self.evaluation_initial_goal_distance_xy[env_ids] = float("nan")
+        perturb_cfg = self.cfg.box_perturbation
+        if not bool(getattr(perturb_cfg, "evaluation_mode", False)):
+            return
+        goal_mode = str(getattr(perturb_cfg, "evaluation_goal_mode", "default"))
+        if goal_mode == "default":
+            return
+        if goal_mode != "long_range":
+            raise ValueError(f"Unknown evaluation goal mode: {goal_mode}")
+        distances = self._set_evaluation_long_range_goals(
+            env_ids,
+            distance_range=tuple(perturb_cfg.evaluation_goal_distance_range),
+            bearing_offset_deg=tuple(perturb_cfg.evaluation_goal_bearing_offset_deg),
+        )
+        self.evaluation_initial_goal_distance_xy[env_ids] = distances
+
+    def _set_evaluation_long_range_goals(
         self,
+        env_ids,
         distance_range=(4.0, 8.0),
         bearing_offset_deg=(15.0, 75.0),
-        env_id=0,
     ):
-        """Evaluation-only replacement goal sampler; does not alter training reset."""
-        env_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
+        """Replace goals without committing an actor observation-history frame."""
         min_distance, max_distance = [float(value) for value in distance_range]
         min_bearing, max_bearing = [float(value) for value in bearing_offset_deg]
         if not (0.0 < min_distance <= max_distance):
@@ -501,8 +529,30 @@ class LeggedRobot(CarryBox):
         self.object2goal_pos = self.box_states[:, :3] - self.goal_pos
         self.object2goal_dist_xy = torch.norm(self.object2goal_pos[:, :2], dim=-1)
         self.object2goal_dist_xyz = torch.norm(self.object2goal_pos, dim=-1)
-        self.compute_observations()
-        return float(distance[0].item())
+        return distance
+
+    def set_evaluation_long_range_goal(
+        self,
+        distance_range=(4.0, 8.0),
+        bearing_offset_deg=(15.0, 75.0),
+        env_id=0,
+    ):
+        """Set one evaluation goal without advancing or committing observations.
+
+        The batch evaluator normally configures long-range mode before reset, so
+        ``_reset_task`` calls this sampler before the reset zero-action step. This
+        public helper remains available for diagnostics, but callers must consume
+        the goal on a later physics step instead of calling ``compute_observations``
+        immediately.
+        """
+        env_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
+        distances = self._set_evaluation_long_range_goals(
+            env_ids,
+            distance_range=distance_range,
+            bearing_offset_deg=bearing_offset_deg,
+        )
+        self.evaluation_initial_goal_distance_xy[env_ids] = distances
+        return float(distances[0].item())
 
     def resolve_force_point_box(self, direction_name, force_point_mode="com", force_point_label="com", env_id=0):
         """Return a box-local force application offset for evaluation sweeps."""

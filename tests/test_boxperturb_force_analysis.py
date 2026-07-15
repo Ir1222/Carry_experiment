@@ -209,6 +209,35 @@ def test_boundary_evaluator_none_force_cap_clears_config_default():
     assert "env.cfg.box_perturbation.force_peak_cap_N = None" in source
 
 
+def test_evaluator_reset_uses_single_history_commit_and_pre_step_goal_hook():
+    evaluator_source = (
+        ROOT / "legged_gym/legged_gym/scripts/evaluate_carrybox_boxperturb.py"
+    ).read_text()
+    perturb_source = (
+        ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py"
+    ).read_text()
+
+    run_trial = evaluator_source.split("def _run_trial(", 1)[1].split(
+        "\ndef _write_csv", 1
+    )[0]
+    goal_sampler = perturb_source.split(
+        "    def _set_evaluation_long_range_goals(", 1
+    )[1].split("    def set_evaluation_long_range_goal(", 1)[0]
+    reset_hook = perturb_source.split("    def _reset_task(self, env_ids):", 1)[1].split(
+        "    def _set_evaluation_long_range_goals(", 1
+    )[0]
+
+    assert "obs, _ = env.reset()" in run_trial
+    assert "env.get_observations()" not in run_trial
+    assert "env.compute_observations()" not in run_trial
+    assert "initial_physics_fingerprint = _tensor_fingerprint(" in run_trial
+    assert "reset_actor_obs_fingerprint = _tensor_fingerprint(obs[0])" in run_trial
+    assert "super()._reset_task(env_ids)" in reset_hook
+    assert "self._set_evaluation_long_range_goals(" in reset_hook
+    assert "self.compute_observations()" not in goal_sampler
+    assert '"goal_before_zero_action_single_commit"' in perturb_source
+
+
 def test_perturb_termination_does_not_require_disabled_long_range_buffers():
     source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
     check_block = source.split("    def check_termination(self):", 1)[1].split(
