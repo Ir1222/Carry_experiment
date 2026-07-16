@@ -62,17 +62,18 @@ def _build_force_point_specs(modes, labels):
     return specs
 
 
-def _apply_eval_goal_if_requested(env, args):
+def _initial_goal_distance_after_reset(env, args):
+    """Read reset metadata without rebuilding or committing actor history."""
     if getattr(args, "eval_goal_mode", "default") == "default":
-        env.compute_observations()
         return 0.0
     if args.eval_goal_mode != "long_range":
         raise ValueError(f"Unknown eval goal mode: {args.eval_goal_mode}")
-    return env.set_evaluation_long_range_goal(
-        distance_range=_parse_float_pair(args.eval_goal_distance_range, (4.0, 8.0)),
-        bearing_offset_deg=_parse_float_pair(args.eval_goal_bearing_offset_deg, (15.0, 75.0)),
-        env_id=0,
-    )
+    distance = float(env.evaluation_initial_goal_distance_xy[0].item())
+    if not np.isfinite(distance):
+        raise RuntimeError(
+            "Long-range evaluation goal was not installed during env.reset()."
+        )
+    return distance
 
 
 def load_actor_only_for_inference(ppo_runner, checkpoint_path, device):
@@ -250,8 +251,7 @@ def run_boxperturb_visual_sweep(env, policy, args):
     for test_index, (beta, direction, point_mode, point_label, duration, profile) in enumerate(test_cells, start=1):
         set_seed(seed)
         obs, _ = env.reset()
-        initial_goal_distance = _apply_eval_goal_if_requested(env, args)
-        obs = env.get_observations()
+        initial_goal_distance = _initial_goal_distance_after_reset(env, args)
         force_point_box, resolved_point_label = env.resolve_force_point_box(
             direction, point_mode, point_label, env_id=0
         )
@@ -398,6 +398,9 @@ def run_boxperturb_visual_sweep(env, policy, args):
         "eval_goal_mode": args.eval_goal_mode,
         "eval_goal_distance_range": list(eval_goal_distance_range),
         "eval_goal_bearing_offset_deg": list(eval_goal_bearing_offset_deg),
+        "observation_history_initialization": (
+            env.EVALUATION_OBSERVATION_HISTORY_INITIALIZATION
+        ),
         "directions": list(directions), "betas": list(betas),
         "force_decomposition": "hand rigid-body net contact force projected on estimated locked box-face normal",
         "ema_tau_s": 0.04, "baseline_valid_physics_substeps": 40,

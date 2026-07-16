@@ -238,6 +238,23 @@ def test_evaluator_reset_uses_single_history_commit_and_pre_step_goal_hook():
     assert '"goal_before_zero_action_single_commit"' in perturb_source
 
 
+def test_play_visual_sweep_uses_reset_observation_without_goal_resampling():
+    source = (ROOT / "legged_gym/legged_gym/scripts/play.py").read_text()
+    sweep = source.split("def run_boxperturb_visual_sweep(", 1)[1].split(
+        "\ndef play(", 1
+    )[0]
+    goal_reader = source.split(
+        "def _initial_goal_distance_after_reset(", 1
+    )[1].split("\ndef load_actor_only_for_inference", 1)[0]
+
+    assert "obs, _ = env.reset()" in sweep
+    assert "_initial_goal_distance_after_reset(env, args)" in sweep
+    assert "env.get_observations()" not in sweep
+    assert "set_evaluation_long_range_goal" not in sweep
+    assert "env.compute_observations()" not in goal_reader
+    assert "env.evaluation_initial_goal_distance_xy[0]" in goal_reader
+
+
 def test_perturb_termination_does_not_require_disabled_long_range_buffers():
     source = (ROOT / "legged_gym/legged_gym/envs/g1/carrybox_boxperturb.py").read_text()
     check_block = source.split("    def check_termination(self):", 1)[1].split(
