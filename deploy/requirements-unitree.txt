@@ -1,0 +1,6 @@
+# Install the official SDK repository first:
+#   git clone https://github.com/unitreerobotics/unitree_sdk2_python.git
+#   pip install -e unitree_sdk2_python
+#
+# This marker file exists so deployment setup can explicitly distinguish the
+# external robot SDK from the normal PyPI runtime dependencies.

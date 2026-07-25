@@ -73,6 +73,11 @@ legged_gym/legged_gym/scripts/wandb
 
 isaacgym
 
+# Generated deployment artifacts (contain weights or machine-local mesh paths)
+/deploy/models/*.onnx
+/deploy/models/*.manifest.json
+/deploy/assets/g1_29dof_physhsi_generated.xml
+
 # other
 *.egg-info
 __pycache__

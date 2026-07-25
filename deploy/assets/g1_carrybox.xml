@@ -1,0 +1,42 @@
+<mujoco model="PhysHSI G1 CarryBox">
+  <include file="g1_29dof_physhsi_generated.xml"/>
+
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="implicitfast">
+    <flag contact="enable"/>
+  </option>
+
+  <statistic center="1 0 0.7" extent="3"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="-125" elevation="-18"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072"/>
+    <texture type="2d" name="ground_texture" builtin="checker" mark="edge"
+             rgb1="0.25 0.30 0.35" rgb2="0.10 0.12 0.14"
+             markrgb="0.8 0.8 0.8" width="256" height="256"/>
+    <material name="ground_material" texture="ground_texture" texuniform="true"
+              texrepeat="8 8" reflectance="0.15"/>
+  </asset>
+
+  <default>
+    <geom friction="0.8 0.02 0.001" condim="3"/>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 3" dir="0 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="ground_material"/>
+
+    <body name="carry_box" pos="1 0 0.135">
+      <freejoint name="box_free_joint"/>
+      <geom name="carry_box_geom" type="box" size="0.15 0.15 0.125"
+            density="50" rgba="0.72 0.42 0.12 1"/>
+    </body>
+
+    <site name="goal_site" type="sphere" pos="2.5 0.75 0.145"
+          size="0.08" rgba="0.1 0.8 0.2 0.55"/>
+  </worldbody>
+</mujoco>
