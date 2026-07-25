@@ -1,0 +1,7 @@
+numpy>=1.23
+PyYAML>=6.0
+mujoco>=3.1.6,<3.2
+onnx>=1.16
+onnxruntime>=1.18
+protobuf>=5.26,<6
+torch>=2.0
