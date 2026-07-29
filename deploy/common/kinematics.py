@@ -37,6 +37,7 @@ class MujocoNameMap:
         *,
         pelvis_body: str = "pelvis",
         torso_body: str = "torso_link",
+        policy_frame_body: str = "pelvis",
         end_effector_names: tuple[str, ...] = END_EFFECTOR_NAMES,
     ) -> None:
         mujoco = _require_mujoco()
@@ -57,6 +58,8 @@ class MujocoNameMap:
         )
         self.pelvis_body_id = int(model.body(pelvis_body).id)
         self.torso_body_id = int(model.body(torso_body).id)
+        self.policy_frame_body_id = int(model.body(policy_frame_body).id)
+        self.policy_frame_body_name = str(policy_frame_body)
         self.end_effector_body_ids = np.asarray(
             [model.body(name).id for name in end_effector_names], dtype=np.int64
         )
@@ -82,47 +85,58 @@ class MujocoNameMap:
             np.asarray(data.qvel[self.joint_dof_adr], dtype=np.float64).copy(),
         )
 
-    def endpoint_positions_torso(self, data) -> np.ndarray:
+    def endpoint_positions_policy_frame(self, data) -> np.ndarray:
         pelvis_position = np.asarray(
             data.xpos[self.pelvis_body_id], dtype=np.float64
         )
-        torso_quat = np.asarray(data.xquat[self.torso_body_id], dtype=np.float64)
+        policy_frame_quat = np.asarray(
+            data.xquat[self.policy_frame_body_id], dtype=np.float64
+        )
         endpoint_world = np.asarray(
             data.xpos[self.end_effector_body_ids], dtype=np.float64
         )
         return np.stack(
             [
-                quat_rotate_inverse_wxyz(torso_quat, position - pelvis_position)
+                quat_rotate_inverse_wxyz(
+                    policy_frame_quat, position - pelvis_position
+                )
                 for position in endpoint_world
             ],
             axis=0,
         )
 
-    def torso_angular_velocity(self, model, data) -> np.ndarray:
+    def body_angular_velocity(self, model, data, body_id: int) -> np.ndarray:
         mujoco = _require_mujoco()
         velocity = np.zeros(6, dtype=np.float64)
         mujoco.mj_objectVelocity(
             model,
             data,
             mujoco.mjtObj.mjOBJ_BODY,
-            self.torso_body_id,
+            int(body_id),
             velocity,
             1,
         )
         return velocity[0:3].copy()
+
+    def policy_frame_angular_velocity(self, model, data) -> np.ndarray:
+        return self.body_angular_velocity(
+            model, data, self.policy_frame_body_id
+        )
 
     def robot_state(self, model, data, *, sequence: int) -> RobotState:
         joint_pos, joint_vel = self.joint_state(data)
         return RobotState(
             sequence=sequence,
             timestamp_ns=time.monotonic_ns(),
-            torso_quat_wxyz=np.asarray(
-                data.xquat[self.torso_body_id], dtype=np.float64
+            policy_frame_quat_wxyz=np.asarray(
+                data.xquat[self.policy_frame_body_id], dtype=np.float64
             ).copy(),
-            torso_ang_vel=self.torso_angular_velocity(model, data),
+            policy_frame_ang_vel=self.policy_frame_angular_velocity(model, data),
             joint_pos=joint_pos,
             joint_vel=joint_vel,
-            end_effector_pos_torso=self.endpoint_positions_torso(data),
+            end_effector_pos_policy_frame=(
+                self.endpoint_positions_policy_frame(data)
+            ),
         )
 
 
@@ -136,6 +150,7 @@ class MujocoKinematicsProvider:
         *,
         pelvis_body: str = "pelvis",
         torso_body: str = "torso_link",
+        policy_frame_body: str = "pelvis",
         end_effector_names: tuple[str, ...] = END_EFFECTOR_NAMES,
     ) -> None:
         mujoco = _require_mujoco()
@@ -146,6 +161,7 @@ class MujocoKinematicsProvider:
             robot,
             pelvis_body=pelvis_body,
             torso_body=torso_body,
+            policy_frame_body=policy_frame_body,
             end_effector_names=end_effector_names,
         )
         self._free_joint_qpos_adr: int | None = None
@@ -162,7 +178,7 @@ class MujocoKinematicsProvider:
         self._set_joint_state(joint_pos)
         mujoco = _require_mujoco()
         mujoco.mj_forward(self.model, self.data)
-        return self.name_map.endpoint_positions_torso(self.data)
+        return self.name_map.endpoint_positions_policy_frame(self.data)
 
     def _set_joint_state(
         self, joint_pos: np.ndarray, joint_vel: np.ndarray | None = None
@@ -192,8 +208,8 @@ class MujocoKinematicsProvider:
         torso_quat = np.asarray(
             self.data.xquat[self.name_map.torso_body_id], dtype=np.float64
         ).copy()
-        relative_gyro = self.name_map.torso_angular_velocity(
-            self.model, self.data
+        relative_gyro = self.name_map.body_angular_velocity(
+            self.model, self.data, self.name_map.torso_body_id
         )
         return torso_quat, relative_gyro
 
@@ -214,17 +230,21 @@ def task_state_from_mujoco(
     pelvis_position = np.asarray(
         data.xpos[name_map.pelvis_body_id], dtype=np.float64
     )
-    torso_quat = np.asarray(data.xquat[name_map.torso_body_id], dtype=np.float64)
+    policy_frame_quat = np.asarray(
+        data.xquat[name_map.policy_frame_body_id], dtype=np.float64
+    )
     box_position = np.asarray(data.xpos[box_id], dtype=np.float64)
     box_quat = np.asarray(data.xquat[box_id], dtype=np.float64)
-    box_pos_torso = quat_rotate_inverse_wxyz(
-        torso_quat, box_position - pelvis_position
+    box_pos_policy_frame = quat_rotate_inverse_wxyz(
+        policy_frame_quat, box_position - pelvis_position
     )
     goal_position_world = np.asarray(goal_position_world, dtype=np.float64)
-    goal_pos_torso = quat_rotate_inverse_wxyz(
-        torso_quat, goal_position_world - pelvis_position
+    goal_pos_policy_frame = quat_rotate_inverse_wxyz(
+        policy_frame_quat, goal_position_world - pelvis_position
     )
-    box_quat_torso = quat_relative_wxyz(torso_quat, box_quat)
+    box_quat_policy_frame = quat_relative_wxyz(
+        policy_frame_quat, box_quat
+    )
     box_gravity = quat_rotate_inverse_wxyz(
         box_quat, np.array([0.0, 0.0, -1.0])
     )
@@ -236,9 +256,9 @@ def task_state_from_mujoco(
     return TaskState(
         sequence=sequence,
         timestamp_ns=time.monotonic_ns(),
-        box_pos_torso=box_pos_torso,
-        box_quat_torso_wxyz=box_quat_torso,
+        box_pos_policy_frame=box_pos_policy_frame,
+        box_quat_policy_frame_wxyz=box_quat_policy_frame,
         box_size=np.asarray(box_size, dtype=np.float64),
-        goal_pos_torso=goal_pos_torso,
+        goal_pos_policy_frame=goal_pos_policy_frame,
         success=success,
     )

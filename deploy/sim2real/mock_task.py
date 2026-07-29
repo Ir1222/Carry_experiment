@@ -1,4 +1,4 @@
-"""Publish a stationary torso-relative TaskState for hardware dry-runs."""
+"""Publish a stationary pelvis-policy-frame TaskState for hardware dry-runs."""
 
 from __future__ import annotations
 
@@ -24,9 +24,9 @@ def main() -> None:
     publisher = UdpPublisher((str(address_value[0]), int(address_value[1])))
     box_size = np.asarray(cfg.section("simulation")["box_size"], dtype=np.float64)
     provider = MockTaskStateProvider(
-        box_pos_torso=args.box_pos,
+        box_pos_policy_frame=args.box_pos,
         box_size=box_size,
-        goal_pos_torso=args.goal_pos,
+        goal_pos_policy_frame=args.goal_pos,
     )
     period = 1.0 / args.rate
     try:

@@ -38,18 +38,22 @@ class MockTaskStateProvider:
     def __init__(
         self,
         *,
-        box_pos_torso=(1.0, 0.0, -0.65),
-        box_quat_torso_wxyz=(1.0, 0.0, 0.0, 0.0),
+        box_pos_policy_frame=(1.0, 0.0, -0.65),
+        box_quat_policy_frame_wxyz=(1.0, 0.0, 0.0, 0.0),
         box_size=(0.3, 0.3, 0.25),
-        goal_pos_torso=(2.5, 0.75, -0.65),
+        goal_pos_policy_frame=(2.5, 0.75, -0.65),
         success: bool = False,
     ) -> None:
-        self.box_pos_torso = np.asarray(box_pos_torso, dtype=np.float64)
-        self.box_quat_torso_wxyz = np.asarray(
-            box_quat_torso_wxyz, dtype=np.float64
+        self.box_pos_policy_frame = np.asarray(
+            box_pos_policy_frame, dtype=np.float64
+        )
+        self.box_quat_policy_frame_wxyz = np.asarray(
+            box_quat_policy_frame_wxyz, dtype=np.float64
         )
         self.box_size = np.asarray(box_size, dtype=np.float64)
-        self.goal_pos_torso = np.asarray(goal_pos_torso, dtype=np.float64)
+        self.goal_pos_policy_frame = np.asarray(
+            goal_pos_policy_frame, dtype=np.float64
+        )
         self.success = bool(success)
         self.sequence = 0
 
@@ -58,10 +62,10 @@ class MockTaskStateProvider:
         return TaskState(
             sequence=self.sequence,
             timestamp_ns=time.monotonic_ns(),
-            box_pos_torso=self.box_pos_torso,
-            box_quat_torso_wxyz=self.box_quat_torso_wxyz,
+            box_pos_policy_frame=self.box_pos_policy_frame,
+            box_quat_policy_frame_wxyz=self.box_quat_policy_frame_wxyz,
             box_size=self.box_size,
-            goal_pos_torso=self.goal_pos_torso,
+            goal_pos_policy_frame=self.goal_pos_policy_frame,
             success=self.success,
         )
 

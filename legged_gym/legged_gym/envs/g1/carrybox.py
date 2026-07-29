@@ -765,6 +765,32 @@ class LeggedRobot(BaseTask):
             current_actor_obs = current_actor_obs + (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec
         
         task_obs_actor, task_obs_critic = self.compute_task_observations()
+        if getattr(self, "_capture_deploy_snapshot", False):
+            env_id = 0
+            self._deploy_snapshot = {
+                "root_position_world": self.root_states[env_id, 0:3].detach().cpu().numpy().copy(),
+                "root_quat_xyzw": self.root_states[env_id, 3:7].detach().cpu().numpy().copy(),
+                "root_linear_velocity_world": self.root_states[env_id, 7:10].detach().cpu().numpy().copy(),
+                "root_angular_velocity_world": self.root_states[env_id, 10:13].detach().cpu().numpy().copy(),
+                "policy_frame_position_world": self.rigid_body_states[env_id, self.upper_body_index, 0:3].detach().cpu().numpy().copy(),
+                "policy_frame_quat_xyzw": self.rigid_body_states[env_id, self.upper_body_index, 3:7].detach().cpu().numpy().copy(),
+                "policy_frame_linear_velocity_world": self.rigid_body_states[env_id, self.upper_body_index, 7:10].detach().cpu().numpy().copy(),
+                "policy_frame_angular_velocity_world": self.rigid_body_states[env_id, self.upper_body_index, 10:13].detach().cpu().numpy().copy(),
+                "torso_position_world": self.rigid_body_states[env_id, self.torso_link_index, 0:3].detach().cpu().numpy().copy(),
+                "torso_quat_xyzw": self.rigid_body_states[env_id, self.torso_link_index, 3:7].detach().cpu().numpy().copy(),
+                "policy_frame_ang_vel": self.base_ang_vel[env_id].detach().cpu().numpy().copy(),
+                "joint_pos": self.dof_pos[env_id].detach().cpu().numpy().copy(),
+                "joint_vel": self.dof_vel[env_id].detach().cpu().numpy().copy(),
+                "end_effector_pos_policy_frame": self.end_effector_pos[env_id].detach().cpu().numpy().copy(),
+                "previous_action": self.actions[env_id].detach().cpu().numpy().copy(),
+                "box_position_world": self.box_states[env_id, 0:3].detach().cpu().numpy().copy(),
+                "box_quat_xyzw": self.box_states[env_id, 3:7].detach().cpu().numpy().copy(),
+                "box_size": self._box_size[env_id].detach().cpu().numpy().copy(),
+                "goal_position_world": self.goal_pos[env_id].detach().cpu().numpy().copy(),
+                "success": self.success_buf[env_id].detach().cpu().numpy().copy(),
+                "current_actor_proprio": current_actor_obs[env_id].detach().cpu().numpy().copy(),
+                "task_observation": task_obs_actor[env_id].detach().cpu().numpy().copy(),
+            }
         return current_actor_obs, task_obs_actor, task_obs_critic
 
     def _build_actor_history_obs(self, current_actor_proprio, task_obs_actor, commit: bool):
@@ -921,6 +947,20 @@ class LeggedRobot(BaseTask):
         """
         current_actor_obs, task_obs_actor, task_obs_critic = self._compute_actor_step_and_task_obs()
         actor_history_obs = self._build_actor_history_obs(current_actor_obs, task_obs_actor, commit=True)
+        if (
+            getattr(self, "_capture_deploy_snapshot", False)
+            and hasattr(self, "_deploy_snapshot")
+        ):
+            self._deploy_snapshot["actor_obs"] = (
+                actor_history_obs[0].detach().cpu().numpy().copy()
+            )
+            self._deploy_snapshot["current_frame"] = (
+                actor_history_obs[0, -self.num_one_step_actor_obs:]
+                .detach()
+                .cpu()
+                .numpy()
+                .copy()
+            )
         log_stats = self._should_log_interaction_priv()
         interaction_priv_proxy = self._compute_interaction_privileged_proxy(log_stats=log_stats)
 

@@ -38,11 +38,46 @@ class DeployConfig:
 
     @property
     def checkpoint_path(self) -> Path:
-        return self.resolve_path(self.section("policy")["checkpoint"])
+        return self.checkpoint_path_for()
 
     @property
     def onnx_path(self) -> Path:
-        return self.resolve_path(self.section("policy")["onnx_path"])
+        return self.onnx_path_for()
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.manifest_path_for()
+
+    @property
+    def default_policy_profile(self) -> str:
+        policy = self.section("policy")
+        return str(policy.get("default_profile", "default"))
+
+    def policy_profile(self, name: str | None = None) -> dict[str, Any]:
+        policy = self.section("policy")
+        profile_name = self.default_policy_profile if name is None else str(name)
+        profiles = policy.get("profiles")
+        if isinstance(profiles, dict):
+            value = profiles.get(profile_name)
+            if not isinstance(value, dict):
+                available = ", ".join(sorted(str(item) for item in profiles))
+                raise KeyError(
+                    f"unknown policy profile {profile_name!r}; "
+                    f"available: {available}"
+                )
+            return value
+        if profile_name not in ("default", self.default_policy_profile):
+            raise KeyError(f"configuration has no policy profile {profile_name!r}")
+        return policy
+
+    def checkpoint_path_for(self, profile: str | None = None) -> Path:
+        return self.resolve_path(self.policy_profile(profile)["checkpoint"])
+
+    def onnx_path_for(self, profile: str | None = None) -> Path:
+        return self.resolve_path(self.policy_profile(profile)["onnx_path"])
+
+    def manifest_path_for(self, profile: str | None = None) -> Path:
+        return self.resolve_path(self.policy_profile(profile)["manifest_path"])
 
     @property
     def urdf_path(self) -> Path:
@@ -108,5 +143,71 @@ def _validate(cfg: DeployConfig) -> None:
             f"{END_EFFECTOR_NAMES}"
         )
     validate_motor_mapping(robot["policy_to_motor"])
+    policy_frame = str(robot.get("policy_frame", "")).lower()
+    if policy_frame != "pelvis":
+        raise ValueError(
+            "CarryBox actor was trained with robot.policy_frame='pelvis'"
+        )
     if str(robot.get("imu_frame", "")).lower() not in ("torso", "pelvis"):
         raise ValueError("robot.imu_frame must be 'torso' or 'pelvis'")
+
+    profiles = policy.get("profiles")
+    if isinstance(profiles, dict):
+        if not profiles:
+            raise ValueError("policy.profiles must not be empty")
+        default_profile = str(policy.get("default_profile", ""))
+        if default_profile not in profiles:
+            raise ValueError(
+                "policy.default_profile must name an entry in policy.profiles"
+            )
+        for profile_name, profile in profiles.items():
+            if not isinstance(profile, dict):
+                raise ValueError(
+                    f"policy.profiles.{profile_name} must be a mapping"
+                )
+            missing = [
+                key
+                for key in ("checkpoint", "onnx_path", "manifest_path")
+                if key not in profile
+            ]
+            if missing:
+                raise ValueError(
+                    f"policy profile {profile_name!r} is missing {missing}"
+                )
+
+    contact_margin = float(simulation.get("contact_margin", 0.0))
+    if contact_margin < 0.0:
+        raise ValueError("simulation.contact_margin must be non-negative")
+    solref = simulation.get("joint_limit_solref", (0.005, 1.0))
+    if (
+        not isinstance(solref, (list, tuple))
+        or len(solref) != 2
+        or float(solref[0]) <= 0.0
+        or float(solref[1]) <= 0.0
+    ):
+        raise ValueError(
+            "simulation.joint_limit_solref must be [timeconst, dampratio] "
+            "with positive values"
+        )
+    if float(solref[0]) < 2.0 * physics_dt and not bool(
+        simulation.get("disable_refsafe_for_joint_limits", False)
+    ):
+        raise ValueError(
+            "joint-limit timeconst below 2*physics_dt requires "
+            "simulation.disable_refsafe_for_joint_limits=true; otherwise "
+            "MuJoCo silently clamps it"
+        )
+    boundary_timeout_ms = float(
+        simulation.get("policy_boundary_timeout_ms", 40.0)
+    )
+    if boundary_timeout_ms <= 0.0:
+        raise ValueError(
+            "simulation.policy_boundary_timeout_ms must be positive"
+        )
+    solimp = simulation.get(
+        "joint_limit_solimp", (0.9, 0.95, 0.001, 0.5, 2.0)
+    )
+    if not isinstance(solimp, (list, tuple)) or len(solimp) != 5:
+        raise ValueError(
+            "simulation.joint_limit_solimp must contain five values"
+        )

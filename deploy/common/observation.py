@@ -58,7 +58,7 @@ class ObservationBuilder:
         self._previous_endpoints = (
             None
             if initial_state is None
-            else initial_state.end_effector_pos_torso.copy()
+            else initial_state.end_effector_pos_policy_frame.copy()
         )
 
     @property
@@ -74,28 +74,30 @@ class ObservationBuilder:
     def build_task_observation(self, task: TaskState) -> np.ndarray:
         if task.success:
             return np.full(15, -1.0, dtype=np.float64)
-        relative_quat = normalize_quat_wxyz(task.box_quat_torso_wxyz)
+        relative_quat = normalize_quat_wxyz(
+            task.box_quat_policy_frame_wxyz
+        )
         return np.concatenate(
             (
-                task.box_pos_torso,
+                task.box_pos_policy_frame,
                 quat_to_tan_norm_wxyz(relative_quat),
                 task.box_size,
-                task.goal_pos_torso,
+                task.goal_pos_policy_frame,
             )
         )
 
     def build_frame(self, robot: RobotState, task: TaskState) -> np.ndarray:
-        endpoints = robot.end_effector_pos_torso.copy()
+        endpoints = robot.end_effector_pos_policy_frame.copy()
         if self.legacy_ankle_delay_steps and self._previous_endpoints is not None:
             endpoints[2:4] = self._previous_endpoints[2:4]
-        self._previous_endpoints = robot.end_effector_pos_torso.copy()
+        self._previous_endpoints = robot.end_effector_pos_policy_frame.copy()
 
         projected_gravity = quat_rotate_inverse_wxyz(
-            robot.torso_quat_wxyz, np.array([0.0, 0.0, -1.0])
+            robot.policy_frame_quat_wxyz, np.array([0.0, 0.0, -1.0])
         )
         frame = np.concatenate(
             (
-                robot.torso_ang_vel * self.ang_vel_scale,
+                robot.policy_frame_ang_vel * self.ang_vel_scale,
                 projected_gravity,
                 (robot.joint_pos - self.default_dof_pos) * self.dof_pos_scale,
                 robot.joint_vel * self.dof_vel_scale,

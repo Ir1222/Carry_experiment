@@ -5,3 +5,4 @@ onnx>=1.16
 onnxruntime>=1.18
 protobuf>=5.26,<6
 torch>=2.0
+pytest>=7.0

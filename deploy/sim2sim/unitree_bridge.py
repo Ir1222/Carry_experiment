@@ -90,8 +90,8 @@ class UnitreeSimulatorBridge:
             motor = low_state.motor_state[int(motor_index)]
             motor.q = float(state.joint_pos[policy_index])
             motor.dq = float(state.joint_vel[policy_index])
-        low_state.imu_state.quaternion[:] = state.torso_quat_wxyz
-        low_state.imu_state.gyroscope[:] = state.torso_ang_vel
+        low_state.imu_state.quaternion[:] = state.policy_frame_quat_wxyz
+        low_state.imu_state.gyroscope[:] = state.policy_frame_ang_vel
         low_state.tick = int(sim_time * 1e3)
         low_state.crc = self._crc.Crc(low_state)
         self._publisher.Write(low_state)

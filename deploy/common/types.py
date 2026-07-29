@@ -20,69 +20,79 @@ def _vector(value: np.ndarray, size: int, name: str) -> np.ndarray:
 class RobotState:
     """Policy-ready robot state.
 
-    Quaternion order is WXYZ. End-effector positions are already expressed in
-    the torso frame after subtracting the pelvis/root translation, matching the
-    training environment.
+    Quaternion order is WXYZ. All frame-dependent values are expressed in the
+    configured policy frame. CarryBox was trained with ``policy_frame=pelvis``.
     """
 
     sequence: int
     timestamp_ns: int
-    torso_quat_wxyz: np.ndarray
-    torso_ang_vel: np.ndarray
+    policy_frame_quat_wxyz: np.ndarray
+    policy_frame_ang_vel: np.ndarray
     joint_pos: np.ndarray
     joint_vel: np.ndarray
-    end_effector_pos_torso: np.ndarray
+    end_effector_pos_policy_frame: np.ndarray
 
     def __post_init__(self) -> None:
-        self.torso_quat_wxyz = _vector(self.torso_quat_wxyz, 4, "torso_quat_wxyz")
-        self.torso_ang_vel = _vector(self.torso_ang_vel, 3, "torso_ang_vel")
+        self.policy_frame_quat_wxyz = _vector(
+            self.policy_frame_quat_wxyz, 4, "policy_frame_quat_wxyz"
+        )
+        self.policy_frame_ang_vel = _vector(
+            self.policy_frame_ang_vel, 3, "policy_frame_ang_vel"
+        )
         self.joint_pos = _vector(self.joint_pos, ACTION_DIM, "joint_pos")
         self.joint_vel = _vector(self.joint_vel, ACTION_DIM, "joint_vel")
-        endpoints = np.asarray(self.end_effector_pos_torso, dtype=np.float64)
+        endpoints = np.asarray(
+            self.end_effector_pos_policy_frame, dtype=np.float64
+        )
         if endpoints.size != 15:
             raise ValueError(
-                "end_effector_pos_torso must contain 5 xyz positions (15 values), "
+                "end_effector_pos_policy_frame must contain 5 xyz positions "
+                "(15 values), "
                 f"got shape {endpoints.shape}"
             )
-        self.end_effector_pos_torso = endpoints.reshape(5, 3)
+        self.end_effector_pos_policy_frame = endpoints.reshape(5, 3)
 
     def is_finite(self) -> bool:
         arrays = (
-            self.torso_quat_wxyz,
-            self.torso_ang_vel,
+            self.policy_frame_quat_wxyz,
+            self.policy_frame_ang_vel,
             self.joint_pos,
             self.joint_vel,
-            self.end_effector_pos_torso,
+            self.end_effector_pos_policy_frame,
         )
         return all(np.isfinite(item).all() for item in arrays)
 
 
 @dataclass(slots=True)
 class TaskState:
-    """Torso-relative box and goal state produced by simulation or perception."""
+    """Policy-frame-relative box and goal state."""
 
     sequence: int
     timestamp_ns: int
-    box_pos_torso: np.ndarray
-    box_quat_torso_wxyz: np.ndarray
+    box_pos_policy_frame: np.ndarray
+    box_quat_policy_frame_wxyz: np.ndarray
     box_size: np.ndarray
-    goal_pos_torso: np.ndarray
+    goal_pos_policy_frame: np.ndarray
     success: bool = False
 
     def __post_init__(self) -> None:
-        self.box_pos_torso = _vector(self.box_pos_torso, 3, "box_pos_torso")
-        self.box_quat_torso_wxyz = _vector(
-            self.box_quat_torso_wxyz, 4, "box_quat_torso_wxyz"
+        self.box_pos_policy_frame = _vector(
+            self.box_pos_policy_frame, 3, "box_pos_policy_frame"
+        )
+        self.box_quat_policy_frame_wxyz = _vector(
+            self.box_quat_policy_frame_wxyz, 4, "box_quat_policy_frame_wxyz"
         )
         self.box_size = _vector(self.box_size, 3, "box_size")
-        self.goal_pos_torso = _vector(self.goal_pos_torso, 3, "goal_pos_torso")
+        self.goal_pos_policy_frame = _vector(
+            self.goal_pos_policy_frame, 3, "goal_pos_policy_frame"
+        )
 
     def is_finite(self) -> bool:
         arrays = (
-            self.box_pos_torso,
-            self.box_quat_torso_wxyz,
+            self.box_pos_policy_frame,
+            self.box_quat_policy_frame_wxyz,
             self.box_size,
-            self.goal_pos_torso,
+            self.goal_pos_policy_frame,
         )
         return all(np.isfinite(item).all() for item in arrays)
 

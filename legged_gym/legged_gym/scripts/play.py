@@ -428,6 +428,19 @@ def play(args):
         # Play only needs the actor. Load it separately so old 126-D critic
         # checkpoints can run with the current 143-D carry-phase environment.
         train_cfg.runner.resume = False
+        if args.deploy_snapshot:
+            if args.deploy_snapshot_count < 1:
+                raise ValueError("--deploy_snapshot_count must be positive")
+            env_cfg.env.num_envs = 1
+            env_cfg.noise.add_noise = False
+            if args.deploy_snapshot_phase:
+                phase_names = ("loco", "pickUp", "carryWith", "putDown")
+                phase_index = phase_names.index(args.deploy_snapshot_phase)
+                env_cfg.asset.box.reset_mode = "random"
+                env_cfg.asset.box.skill_init_prob = [
+                    float(index == phase_index)
+                    for index in range(len(phase_names))
+                ]
     if args.task == 'carrybox_boxperturb_resume':
         env_cfg.box_perturbation.enabled = not args.disable_box_perturb
         env_cfg.box_perturbation.debug_force_event = args.debug_force_event
@@ -471,6 +484,11 @@ def play(args):
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+    if args.deploy_snapshot:
+        if args.task != 'carrybox':
+            raise ValueError("--deploy_snapshot is supported only for --task carrybox")
+        env._capture_deploy_snapshot = True
+    deploy_snapshot_index = 0
     obs = env.get_observations()
 
     # load policy
@@ -509,6 +527,46 @@ def play(args):
             env.play_dataset_step(i)
         else:
             obs, _, rews, dones, infos, _, _, amp_state = env.step(actions.detach())
+
+            if args.deploy_snapshot and hasattr(env, "_deploy_snapshot"):
+                requested_path = os.path.abspath(
+                    os.path.expanduser(args.deploy_snapshot)
+                )
+                if args.deploy_snapshot_count == 1:
+                    snapshot_path = requested_path
+                else:
+                    requested_root, requested_ext = os.path.splitext(
+                        requested_path
+                    )
+                    phase = args.deploy_snapshot_phase or "default"
+                    if requested_ext.lower() == ".npz":
+                        snapshot_path = (
+                            f"{requested_root}_{phase}_"
+                            f"{deploy_snapshot_index:03d}.npz"
+                        )
+                    else:
+                        snapshot_path = os.path.join(
+                            requested_path,
+                            f"{phase}_{deploy_snapshot_index:03d}.npz",
+                        )
+                parent = os.path.dirname(snapshot_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                snapshot = dict(env._deploy_snapshot)
+                snapshot["snapshot_phase"] = np.asarray(
+                    args.deploy_snapshot_phase or "default"
+                )
+                snapshot["snapshot_index"] = np.asarray(
+                    deploy_snapshot_index, dtype=np.int64
+                )
+                np.savez(snapshot_path, **snapshot)
+                print(f"Wrote CarryBox deployment snapshot: {snapshot_path}")
+                deploy_snapshot_index += 1
+                if deploy_snapshot_index >= args.deploy_snapshot_count:
+                    return
+                obs, _ = env.reset()
+                env._capture_deploy_snapshot = True
+                continue
 
             # Carry phase detection: print the detector result while replaying carrybox.pt.
             if args.task == 'carrybox' and CARRY_PHASE_DEBUG and i % CARRY_PHASE_DEBUG_INTERVAL == 0:

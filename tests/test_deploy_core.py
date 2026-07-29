@@ -33,7 +33,9 @@ from deploy.common.transport import (
 )
 from deploy.common.types import RobotState, TaskState
 from deploy.policy.core import PolicyCore
+from deploy.policy.backends import SequenceStatePair
 from deploy.policy.inference import OnnxActor
+from deploy.policy.run import classify_sequence
 from deploy.tools.export_actor import load_actor_from_checkpoint
 
 
@@ -45,11 +47,11 @@ def make_robot(sequence=1, timestamp_ns=None, endpoint_offset=0.0):
     return RobotState(
         sequence=sequence,
         timestamp_ns=time.monotonic_ns() if timestamp_ns is None else timestamp_ns,
-        torso_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-        torso_ang_vel=np.array([1.0, 2.0, 3.0]),
+        policy_frame_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+        policy_frame_ang_vel=np.array([1.0, 2.0, 3.0]),
         joint_pos=np.asarray(DEFAULT_DOF_POS),
         joint_vel=np.ones(ACTION_DIM),
-        end_effector_pos_torso=endpoints,
+        end_effector_pos_policy_frame=endpoints,
     )
 
 
@@ -57,10 +59,10 @@ def make_task(sequence=1, timestamp_ns=None, success=False):
     return TaskState(
         sequence=sequence,
         timestamp_ns=time.monotonic_ns() if timestamp_ns is None else timestamp_ns,
-        box_pos_torso=np.array([1.0, 2.0, 3.0]),
-        box_quat_torso_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+        box_pos_policy_frame=np.array([1.0, 2.0, 3.0]),
+        box_quat_policy_frame_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
         box_size=np.array([0.3, 0.3, 0.25]),
-        goal_pos_torso=np.array([4.0, 5.0, 6.0]),
+        goal_pos_policy_frame=np.array([4.0, 5.0, 6.0]),
         success=success,
     )
 
@@ -111,9 +113,15 @@ def test_observation_shape_order_history_and_legacy_ankle_delay():
     frame1 = obs1[0, -FRAME_OBS_DIM:]
     slices1 = builder.frame_slices(frame1)
     endpoints = slices1["end_effector_pos"].reshape(5, 3)
-    np.testing.assert_allclose(endpoints[0:2], robot1.end_effector_pos_torso[0:2])
-    np.testing.assert_allclose(endpoints[2:4], robot0.end_effector_pos_torso[2:4])
-    np.testing.assert_allclose(endpoints[4], robot1.end_effector_pos_torso[4])
+    np.testing.assert_allclose(
+        endpoints[0:2], robot1.end_effector_pos_policy_frame[0:2]
+    )
+    np.testing.assert_allclose(
+        endpoints[2:4], robot0.end_effector_pos_policy_frame[2:4]
+    )
+    np.testing.assert_allclose(
+        endpoints[4], robot1.end_effector_pos_policy_frame[4]
+    )
     np.testing.assert_allclose(slices1["previous_action"], 2.0)
     assert OBSERVATION_SLICES["task"] == (108, 123)
 
@@ -158,6 +166,36 @@ def test_udp_packet_roundtrips():
     np.testing.assert_allclose(task2.box_size, task.box_size, atol=1e-7)
     np.testing.assert_allclose(command2.q_target, command.q_target, atol=1e-7)
     assert command2.armed
+    legacy = bytearray(pack_robot_state(robot))
+    legacy[4] = 1
+    with pytest.raises(ValueError, match="version=1"):
+        unpack_robot_state(bytes(legacy))
+
+
+def test_sequence_duplicates_are_not_resets():
+    assert classify_sequence(1, -1) == "new"
+    assert classify_sequence(2, 1) == "new"
+    assert classify_sequence(2, 2) == "duplicate"
+    assert classify_sequence(0, 2) == "reset"
+
+
+def test_udp_state_pair_never_mixes_robot_and_task_sequences():
+    pair = SequenceStatePair()
+    robot_10 = make_robot(sequence=10)
+    task_9 = make_task(sequence=9)
+    task_10 = make_task(sequence=10)
+    robot_11 = make_robot(sequence=11)
+    assert pair.update(robot_10, task_9) == (None, None)
+    synchronized = pair.update(task=task_10)
+    assert synchronized[0] is robot_10
+    assert synchronized[1] is task_10
+    synchronized = pair.update(robot=robot_11)
+    assert synchronized[0] is robot_10
+    assert synchronized[1] is task_10
+    task_11 = make_task(sequence=11)
+    synchronized = pair.update(task=task_11)
+    assert synchronized[0] is robot_11
+    assert synchronized[1] is task_11
 
 
 def test_safety_gate_is_fail_closed():
@@ -172,7 +210,7 @@ def test_safety_gate_is_fail_closed():
     stale = make_task(timestamp_ns=time.monotonic_ns() - int(1e9))
     assert gate.evaluate(robot, stale, armed=True, dry_run=False).reason == "task state stale"
     invalid_quat = make_task()
-    invalid_quat.box_quat_torso_wxyz[:] = 0.0
+    invalid_quat.box_quat_policy_frame_wxyz[:] = 0.0
     assert (
         gate.evaluate(robot, invalid_quat, armed=True, dry_run=False).reason
         == "invalid task quaternion norm 0.000000"
@@ -188,6 +226,28 @@ def test_safety_gate_is_fail_closed():
         gate.evaluate(robot, task, armed=True, dry_run=False).reason
         == "emergency stop latched"
     )
+
+
+def test_sim_parity_joint_limits_warn_before_episode_failure():
+    cfg = load_deploy_config(CONFIG_PATH)
+    description = RobotDescription.from_urdf(cfg.urdf_path)
+    gate = SafetyGate(
+        description,
+        profile="sim_parity",
+        sim_joint_limit_tolerance=0.02,
+    )
+    task = make_task()
+    near = make_robot()
+    near.joint_pos[4] = description.lower_limits[4] - 0.01
+    decision = gate.evaluate(near, task, armed=True, dry_run=False)
+    assert decision.allowed
+    assert decision.warnings
+    severe = make_robot()
+    severe.joint_pos[4] = description.lower_limits[4] - 0.03
+    decision = gate.evaluate(severe, task, armed=True, dry_run=False)
+    assert not decision.allowed
+    assert decision.latch
+    assert decision.episode_failed
 
 
 def test_default_checkpoint_actor_contract():
@@ -271,13 +331,49 @@ def test_policy_core_never_echoes_invalid_joint_state_to_hold_command():
     np.testing.assert_allclose(step.command.q_target, DEFAULT_DOF_POS)
 
 
-def test_mujoco_name_mapping_and_ten_second_smoke():
+def test_mujoco_name_mapping_physics_profile_and_finite_ten_seconds():
     pytest.importorskip("mujoco")
     from deploy.sim2sim.mujoco_server import MujocoServer
 
     cfg = load_deploy_config(CONFIG_PATH)
     server = MujocoServer(cfg, transport="udp", viewer=False)
     try:
+        collision = (server.model.geom_contype != 0) | (
+            server.model.geom_conaffinity != 0
+        )
+        np.testing.assert_allclose(
+            server.model.geom_margin[collision], 0.01
+        )
+        limited = server.model.jnt_limited.astype(bool)
+        np.testing.assert_allclose(
+            server.model.jnt_solref[limited, 0], 0.01
+        )
+        np.testing.assert_allclose(
+            server.model.jnt_solimp[limited][0],
+            [0.99, 0.999, 0.001, 0.5, 2.0],
+        )
+        assert np.unique(
+            server.model.jnt_solimp[limited], axis=0
+        ).shape == (1, 5)
+        assert not (
+            int(server.model.opt.disableflags)
+            & int(server.mujoco.mjtDisableBit.mjDSBL_REFSAFE)
+        )
+        waist_roll_qpos = server.name_map.joint_qpos_adr[13]
+        server.data.qpos[waist_roll_qpos] = 0.35
+        server.mujoco.mj_forward(server.model, server.data)
+        state = server.name_map.robot_state(
+            server.model, server.data, sequence=1
+        )
+        np.testing.assert_allclose(
+            state.policy_frame_quat_wxyz,
+            server.data.xquat[server.name_map.pelvis_body_id],
+        )
+        assert not np.allclose(
+            state.policy_frame_quat_wxyz,
+            server.data.xquat[server.name_map.torso_body_id],
+        )
+        server.reset()
         server.physics_started = True
         previous_time = server.data.time
         for _ in range(2000):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 
 import numpy as np
@@ -15,6 +16,7 @@ from deploy.common.kinematics import (
 )
 from deploy.common.jsonl import JsonlRecorder
 from deploy.common.mapping import RobotDescription
+from deploy.common.math_utils import quat_rotate_inverse_wxyz
 from deploy.common.transport import (
     UdpLatestReceiver,
     UdpPublisher,
@@ -64,6 +66,7 @@ class MujocoServer:
             self.robot,
             pelvis_body=self.robot_cfg["base_body"],
             torso_body=self.robot_cfg["torso_body"],
+            policy_frame_body=self.robot_cfg["policy_frame"],
             end_effector_names=tuple(self.robot_cfg["end_effectors"]),
         )
         if self.name_map.actuator_ids is None:
@@ -76,6 +79,20 @@ class MujocoServer:
         self.stop_requested = False
         self._configure_transport()
         self._configure_scene()
+        self.physics_fingerprint = self._configure_physics_profile()
+        print(
+            "MuJoCo physics profile: "
+            + json.dumps(self.physics_fingerprint, sort_keys=True)
+        )
+        self.recorder.write(
+            {
+                "kind": "run_metadata",
+                "component": "mujoco_server",
+                "protocol_version": 2,
+                "policy_frame": self.robot_cfg["policy_frame"],
+                "physics": self.physics_fingerprint,
+            }
+        )
         self.reset()
 
     @staticmethod
@@ -116,6 +133,14 @@ class MujocoServer:
         self.box_body_id = int(self.model.body("carry_box").id)
         self.box_geom_id = int(self.model.geom("carry_box_geom").id)
         self.goal_site_id = int(self.model.site("goal_site").id)
+        self.head_body_id = int(self.model.body("mid360_link").id)
+        self.hip_yaw_body_ids = np.asarray(
+            [
+                int(self.model.body("left_hip_yaw_link").id),
+                int(self.model.body("right_hip_yaw_link").id),
+            ],
+            dtype=np.int32,
+        )
         self.model.geom_size[self.box_geom_id, :3] = self.box_size / 2.0
         density = float(self.sim_cfg["box_density"])
         mass = density * float(np.prod(self.box_size))
@@ -127,6 +152,71 @@ class MujocoServer:
             * np.asarray((y * y + z * z, x * x + z * z, x * x + y * y))
         )
         self.model.site_pos[self.goal_site_id] = self.goal_position
+
+    def _configure_physics_profile(self) -> dict:
+        contact_margin = float(self.sim_cfg.get("contact_margin", 0.0))
+        collision_mask = (self.model.geom_contype != 0) | (
+            self.model.geom_conaffinity != 0
+        )
+        self.model.geom_margin[collision_mask] = contact_margin
+
+        solref = np.asarray(
+            self.sim_cfg.get("joint_limit_solref", (0.005, 1.0)),
+            dtype=np.float64,
+        )
+        limited = self.model.jnt_limited.astype(bool)
+        self.model.jnt_solref[limited, :2] = solref
+        solimp = np.asarray(
+            self.sim_cfg.get(
+                "joint_limit_solimp",
+                (0.9, 0.95, 0.001, 0.5, 2.0),
+            ),
+            dtype=np.float64,
+        )
+        self.model.jnt_solimp[limited, :5] = solimp
+        disable_refsafe = bool(
+            self.sim_cfg.get("disable_refsafe_for_joint_limits", False)
+        )
+        if disable_refsafe:
+            self.model.opt.disableflags |= int(
+                self.mujoco.mjtDisableBit.mjDSBL_REFSAFE
+            )
+
+        base_joint_id = int(self.model.joint("floating_base_joint").id)
+        base_dof_adr = int(self.model.jnt_dofadr[base_joint_id])
+        linear_damping = float(
+            self.sim_cfg.get("body_linear_damping", 0.0)
+        )
+        angular_damping = float(
+            self.sim_cfg.get("body_angular_damping", 0.0)
+        )
+        self.model.dof_damping[base_dof_adr : base_dof_adr + 3] = (
+            linear_damping
+        )
+        self.model.dof_damping[base_dof_adr + 3 : base_dof_adr + 6] = (
+            angular_damping
+        )
+        return {
+            "timestep": float(self.model.opt.timestep),
+            "integrator": int(self.model.opt.integrator),
+            "solver": int(self.model.opt.solver),
+            "iterations": int(self.model.opt.iterations),
+            "contact_margin": contact_margin,
+            "collision_geom_count": int(np.count_nonzero(collision_mask)),
+            "joint_limit_solref": solref.tolist(),
+            "joint_limit_solimp": solimp.tolist(),
+            "refsafe_disabled": disable_refsafe,
+            "limited_joint_count": int(np.count_nonzero(limited)),
+            "body_linear_damping": linear_damping,
+            "body_angular_damping": angular_damping,
+            "ground_friction": self.model.geom_friction[
+                int(self.model.geom("floor").id)
+            ].tolist(),
+            "box_mass": float(self.model.body_mass[self.box_body_id]),
+            "box_inertia": self.model.body_inertia[
+                self.box_body_id
+            ].tolist(),
+        }
 
     def _free_joint_address(self, name: str) -> int:
         return int(self.model.joint(name).qposadr)
@@ -166,6 +256,17 @@ class MujocoServer:
         )
         self.has_received_command = False
         self.physics_started = False
+        self.pending_command: PolicyCommand | None = None
+        self.control_substep = 0
+        self.control_decimation = int(self.control_cfg["decimation"])
+        self.last_boundary_wait_ms = 0.0
+        self._interval_max_gravity_xy = 0.0
+        self._interval_max_joint_violation = 0.0
+        self._interval_ground_contact_bodies: set[str] = set()
+        self.episode_failed = False
+        self.episode_failure_reason = ""
+        self.episode_failure_sequence: int | None = None
+        self.episode_failure_sim_time: float | None = None
         self.reset_requested = False
 
     def _poll_command(self) -> None:
@@ -175,11 +276,33 @@ class MujocoServer:
             else self.unitree_bridge.poll_command()
         )
         if command is not None and command.is_finite():
-            self.last_command = command
             self.has_received_command = True
-            if command.armed:
-                self.physics_started = True
-        age_ns = time.monotonic_ns() - self.last_command.timestamp_ns
+            if command.armed and self.episode_failed:
+                pass
+            elif command.armed:
+                if not self.physics_started:
+                    self.last_command = command
+                    self.pending_command = None
+                    self.control_substep = 0
+                    # Paused-state publications may advance while the first
+                    # action is in flight. Re-anchor the active physics
+                    # sequence to the exact state used by that action so the
+                    # next policy boundary is source_sequence + 4.
+                    self.sequence = int(command.sequence)
+                    self.physics_started = True
+                else:
+                    self.pending_command = command
+            else:
+                self.last_command = command
+                self.pending_command = None
+                self.control_substep = 0
+                self.physics_started = False
+        newest_command = (
+            self.pending_command
+            if self.pending_command is not None
+            else self.last_command
+        )
+        age_ns = time.monotonic_ns() - newest_command.timestamp_ns
         if self.has_received_command and age_ns > int(0.2e9):
             joint_pos, _ = self.name_map.joint_state(self.data)
             self.last_command = PolicyCommand(
@@ -192,6 +315,100 @@ class MujocoServer:
                 armed=False,
                 reason="command timeout damping hold",
             )
+            self.pending_command = None
+            self.control_substep = 0
+            self.physics_started = False
+
+    @staticmethod
+    def _roll_pitch_from_wxyz(quaternion: np.ndarray) -> tuple[float, float]:
+        w, x, y, z = np.asarray(quaternion, dtype=np.float64)
+        roll = np.arctan2(
+            2.0 * (w * x + y * z),
+            1.0 - 2.0 * (x * x + y * y),
+        )
+        pitch = np.arcsin(
+            np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
+        )
+        return float(roll), float(pitch)
+
+    def _training_termination_reason(
+        self,
+        robot_state,
+        projected_gravity: np.ndarray,
+    ) -> str | None:
+        gravity_xy = float(np.linalg.norm(projected_gravity[:2]))
+        if gravity_xy > float(
+            self.cfg.section("safety")["max_projected_gravity_xy"]
+        ):
+            return (
+                "training projected-gravity termination: "
+                f"xy={gravity_xy:.6f}"
+            )
+        head_height = float(self.data.xpos[self.head_body_id, 2])
+        if head_height < float(
+            self.sim_cfg.get("termination_head_height", 0.6)
+        ):
+            return (
+                "training head-height termination: "
+                f"z={head_height:.6f}"
+            )
+        root_height = float(
+            self.data.xpos[self.name_map.pelvis_body_id, 2]
+        )
+        if root_height < float(
+            self.sim_cfg.get("termination_root_height", 0.2)
+        ):
+            return (
+                "training root-height termination: "
+                f"z={root_height:.6f}"
+            )
+        hip_heights = self.data.xpos[self.hip_yaw_body_ids, 2]
+        hip_min_index = int(np.argmin(hip_heights))
+        hip_min = float(hip_heights[hip_min_index])
+        if hip_min < float(
+            self.sim_cfg.get("termination_hip_yaw_height", 0.15)
+        ):
+            body_name = self.model.body(
+                int(self.hip_yaw_body_ids[hip_min_index])
+            ).name
+            return (
+                "training hip-height termination: "
+                f"body={body_name} z={hip_min:.6f}"
+            )
+        roll, pitch = self._roll_pitch_from_wxyz(
+            robot_state.policy_frame_quat_wxyz
+        )
+        if abs(roll) > float(
+            self.sim_cfg.get("termination_roll_abs", 0.5)
+        ):
+            return f"training roll termination: roll={roll:.6f}"
+        if abs(pitch) > float(
+            self.sim_cfg.get("termination_pitch_abs", 1.1)
+        ):
+            return f"training pitch termination: pitch={pitch:.6f}"
+        return None
+
+    def _latch_episode_failure(self, reason: str) -> None:
+        if self.episode_failed:
+            return
+        self.episode_failed = True
+        self.episode_failure_reason = reason
+        self.episode_failure_sequence = self.sequence
+        self.episode_failure_sim_time = float(self.data.time)
+        joint_pos, _ = self.name_map.joint_state(self.data)
+        self.last_command = PolicyCommand(
+            sequence=self.sequence,
+            timestamp_ns=time.monotonic_ns(),
+            raw_action=np.zeros(29),
+            q_target=joint_pos,
+            kp=np.zeros(29),
+            kd=np.asarray(KD),
+            armed=False,
+            reason=f"episode failed: {reason}",
+        )
+        self.pending_command = None
+        self.control_substep = 0
+        self.physics_started = False
 
     def _apply_command(self) -> np.ndarray:
         joint_pos, joint_vel = self.name_map.joint_state(self.data)
@@ -207,8 +424,67 @@ class MujocoServer:
         self.data.ctrl[self.name_map.actuator_ids] = torque
         return torque
 
-    def _publish(self):
-        self.sequence += 1
+    def _wait_for_boundary_command(self) -> None:
+        """Synchronize the next 4-step block with its boundary observation."""
+
+        if not self.physics_started or self.control_substep != 0:
+            self.last_boundary_wait_ms = 0.0
+            return
+        wait_start = time.perf_counter()
+        required_state_sequence = self.sequence
+        if (
+            self.pending_command is None
+            and self.last_command.sequence >= required_state_sequence
+        ):
+            self.last_boundary_wait_ms = 0.0
+            return
+        timeout_s = float(
+            self.sim_cfg.get("policy_boundary_timeout_ms", 40.0)
+        ) / 1000.0
+        deadline = time.perf_counter() + timeout_s
+        next_republish = time.perf_counter()
+        while self.physics_started:
+            if (
+                self.pending_command is not None
+                and self.pending_command.sequence >= required_state_sequence
+            ):
+                self.last_boundary_wait_ms = (
+                    time.perf_counter() - wait_start
+                ) * 1000.0
+                return
+            if time.perf_counter() >= deadline:
+                joint_pos, _ = self.name_map.joint_state(self.data)
+                self.last_command = PolicyCommand(
+                    sequence=required_state_sequence,
+                    timestamp_ns=time.monotonic_ns(),
+                    raw_action=np.zeros(29),
+                    q_target=joint_pos,
+                    kp=np.zeros(29),
+                    kd=np.asarray(KD),
+                    armed=False,
+                    reason=(
+                        "policy boundary timeout waiting for state "
+                        f"{required_state_sequence}"
+                    ),
+                )
+                self.pending_command = None
+                self.physics_started = False
+                self.last_boundary_wait_ms = (
+                    time.perf_counter() - wait_start
+                ) * 1000.0
+                return
+            if time.perf_counter() >= next_republish:
+                # UDP is intentionally best-effort. Re-publish the frozen
+                # boundary with a fresh monotonic timestamp so one dropped
+                # state/task packet cannot deadlock the 4-step handshake.
+                self._publish(advance_sequence=False)
+                next_republish = time.perf_counter() + 0.002
+            time.sleep(0.0005)
+            self._poll_command()
+
+    def _publish(self, *, advance_sequence: bool = True):
+        if advance_sequence:
+            self.sequence += 1
         robot_state = self.name_map.robot_state(
             self.model, self.data, sequence=self.sequence
         )
@@ -234,67 +510,200 @@ class MujocoServer:
 
     def step(self) -> None:
         self._poll_command()
+        self._wait_for_boundary_command()
         if self.physics_started:
+            if self.control_substep == 0 and self.pending_command is not None:
+                self.last_command = self.pending_command
+                self.pending_command = None
             torque = self._apply_command()
             self.mujoco.mj_step(self.model, self.data)
+            self.control_substep = (
+                self.control_substep + 1
+            ) % self.control_decimation
         else:
             torque = np.zeros(29, dtype=np.float64)
             self.data.ctrl[:] = 0.0
             self.data.time += float(self.model.opt.timestep)
             self.mujoco.mj_forward(self.model, self.data)
         robot_state, task_state = self._publish()
+        projected_gravity = quat_rotate_inverse_wxyz(
+            robot_state.policy_frame_quat_wxyz,
+            np.array([0.0, 0.0, -1.0]),
+        )
+        failure_reason = self._training_termination_reason(
+            robot_state, projected_gravity
+        )
+        if failure_reason is not None:
+            self._latch_episode_failure(failure_reason)
         if not self.recorder.enabled:
             return
         contacts = []
+        ground_contact_bodies: set[str] = set()
+        max_contact_force = 0.0
+        detailed_log = (
+            self.control_substep == 0
+            if self.physics_started
+            else self.sequence % self.control_decimation == 0
+        )
         for contact_index in range(int(self.data.ncon)):
             contact = self.data.contact[contact_index]
-            force = np.zeros(6, dtype=np.float64)
-            self.mujoco.mj_contactForce(
-                self.model, self.data, contact_index, force
+            force = None
+            if detailed_log:
+                force = np.zeros(6, dtype=np.float64)
+                self.mujoco.mj_contactForce(
+                    self.model, self.data, contact_index, force
+                )
+                max_contact_force = max(
+                    max_contact_force, float(np.linalg.norm(force[:3]))
+                )
+            geom1 = (
+                self.mujoco.mj_id2name(
+                    self.model,
+                    self.mujoco.mjtObj.mjOBJ_GEOM,
+                    int(contact.geom1),
+                )
+                or int(contact.geom1)
             )
-            contacts.append(
+            geom2 = (
+                self.mujoco.mj_id2name(
+                    self.model,
+                    self.mujoco.mjtObj.mjOBJ_GEOM,
+                    int(contact.geom2),
+                )
+                or int(contact.geom2)
+            )
+            body1 = self.model.body(
+                int(self.model.geom_bodyid[int(contact.geom1)])
+            ).name
+            body2 = self.model.body(
+                int(self.model.geom_bodyid[int(contact.geom2)])
+            ).name
+            if str(geom1).lower() == "floor":
+                ground_contact_bodies.add(body2)
+            if str(geom2).lower() == "floor":
+                ground_contact_bodies.add(body1)
+            if detailed_log:
+                contacts.append(
+                    {
+                        "geom1": geom1,
+                        "geom2": geom2,
+                        "body1": body1,
+                        "body2": body2,
+                        "force_contact_frame": force,
+                    }
+                )
+        joint_violation = np.maximum(
+            np.maximum(
+                self.robot.lower_limits - robot_state.joint_pos,
+                robot_state.joint_pos - self.robot.upper_limits,
+            ),
+            0.0,
+        )
+        self._interval_max_gravity_xy = max(
+            self._interval_max_gravity_xy,
+            float(np.linalg.norm(projected_gravity[:2])),
+        )
+        self._interval_max_joint_violation = max(
+            self._interval_max_joint_violation,
+            float(np.max(joint_violation)),
+        )
+        self._interval_ground_contact_bodies.update(
+            ground_contact_bodies
+        )
+        if not detailed_log:
+            return
+        record = {
+            "kind": "mujoco_step",
+            "wall_timestamp_ns": time.monotonic_ns(),
+            "sim_time": self.data.time,
+            "sequence": robot_state.sequence,
+            "physics_step_stride": self.control_decimation,
+            "projected_gravity": projected_gravity,
+            "max_projected_gravity_xy_interval": (
+                self._interval_max_gravity_xy
+            ),
+            "pelvis_position_world": self.data.xpos[
+                self.name_map.pelvis_body_id
+            ].copy(),
+            "command_armed": self.last_command.armed,
+            "command_reason": self.last_command.reason,
+            "active_command_source_sequence": self.last_command.sequence,
+            "pending_command_source_sequence": (
+                None
+                if self.pending_command is None
+                else self.pending_command.sequence
+            ),
+            "control_substep": self.control_substep,
+            "boundary_wait_ms": self.last_boundary_wait_ms,
+            "physics_started": self.physics_started,
+            "episode_failed": self.episode_failed,
+            "episode_failure_reason": self.episode_failure_reason,
+            "episode_failure_sequence": self.episode_failure_sequence,
+            "episode_failure_sim_time": self.episode_failure_sim_time,
+            "joint_limit_violation_max": (
+                self._interval_max_joint_violation
+            ),
+            "box_position_world": self.data.xpos[self.box_body_id].copy(),
+            "success": task_state.success,
+            "contact_count": int(self.data.ncon),
+            "max_contact_force": max_contact_force,
+            "ground_contact_bodies": sorted(
+                self._interval_ground_contact_bodies
+            ),
+            "detail": detailed_log,
+        }
+        if detailed_log:
+            record.update(
                 {
-                    "geom1": self.mujoco.mj_id2name(
-                        self.model,
-                        self.mujoco.mjtObj.mjOBJ_GEOM,
-                        int(contact.geom1),
-                    )
-                    or int(contact.geom1),
-                    "geom2": self.mujoco.mj_id2name(
-                        self.model,
-                        self.mujoco.mjtObj.mjOBJ_GEOM,
-                        int(contact.geom2),
-                    )
-                    or int(contact.geom2),
-                    "force_contact_frame": force,
+                    "joint_pos": robot_state.joint_pos,
+                    "joint_vel": robot_state.joint_vel,
+                    "policy_frame_quat_wxyz": (
+                        robot_state.policy_frame_quat_wxyz
+                    ),
+                    "policy_frame_ang_vel": (
+                        robot_state.policy_frame_ang_vel
+                    ),
+                    "raw_action": self.last_command.raw_action,
+                    "q_target": self.last_command.q_target,
+                    "torque": torque,
+                    "joint_limit_violation": joint_violation,
+                    "box_pos_policy_frame": (
+                        task_state.box_pos_policy_frame
+                    ),
+                    "box_quat_policy_frame_wxyz": (
+                        task_state.box_quat_policy_frame_wxyz
+                    ),
+                    "goal_pos_policy_frame": (
+                        task_state.goal_pos_policy_frame
+                    ),
+                    "contacts": contacts,
                 }
             )
-        self.recorder.write(
-            {
-                "kind": "mujoco_step",
-                "sim_time": self.data.time,
-                "sequence": robot_state.sequence,
-                "joint_pos": robot_state.joint_pos,
-                "joint_vel": robot_state.joint_vel,
-                "torso_quat_wxyz": robot_state.torso_quat_wxyz,
-                "torso_ang_vel": robot_state.torso_ang_vel,
-                "raw_action": self.last_command.raw_action,
-                "q_target": self.last_command.q_target,
-                "torque": torque,
-                "box_pos_torso": task_state.box_pos_torso,
-                "box_quat_torso_wxyz": task_state.box_quat_torso_wxyz,
-                "goal_pos_torso": task_state.goal_pos_torso,
-                "success": task_state.success,
-                "contact_count": int(self.data.ncon),
-                "contacts": contacts,
-            }
-        )
+        self.recorder.write(record)
+        self._interval_max_gravity_xy = 0.0
+        self._interval_max_joint_violation = 0.0
+        self._interval_ground_contact_bodies.clear()
 
     def _key_callback(self, keycode: int) -> None:
         if keycode == 259:  # GLFW_BACKSPACE
             self.reset_requested = True
         elif keycode in (81, 256):  # Q or ESC
             self.stop_requested = True
+
+    @staticmethod
+    def _wait_until(deadline: float) -> None:
+        """Wait accurately enough for 200 Hz on Linux and Windows hosts."""
+
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                return
+            if remaining > 0.0015:
+                time.sleep(remaining - 0.001)
+            else:
+                # A short yield/spin tail avoids accumulating millisecond
+                # scheduler oversleep at every 5 ms physics tick.
+                time.sleep(0)
 
     def run(self, *, duration: float | None = None) -> None:
         period = float(self.sim_cfg["physics_dt"])
@@ -312,6 +721,8 @@ class MujocoServer:
                     break
                 if viewer_context is not None and not viewer_context.is_running():
                     break
+                if bool(self.sim_cfg.get("realtime", True)):
+                    self._wait_until(next_tick)
                 if self.reset_requested:
                     self.reset()
                 self.step()
@@ -319,10 +730,7 @@ class MujocoServer:
                     viewer_context.sync()
                 if bool(self.sim_cfg.get("realtime", True)):
                     next_tick += period
-                    delay = next_tick - time.perf_counter()
-                    if delay > 0:
-                        time.sleep(delay)
-                    else:
+                    if next_tick < time.perf_counter() - 1.0:
                         next_tick = time.perf_counter()
         finally:
             if viewer_context is not None:

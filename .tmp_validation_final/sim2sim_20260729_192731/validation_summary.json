@@ -1,0 +1,62 @@
+{
+  "format_version": 1,
+  "config": "D:\\AAAProject\\base_experi\\PhysHSI\\deploy\\config\\g1_carrybox.yaml",
+  "duration_seconds": 20.0,
+  "warmup_seconds": 0.5,
+  "all_passed": false,
+  "models": [
+    {
+      "model_profile": "official_carrybox_65000",
+      "policy_steps": 809,
+      "safe_steps": 786,
+      "safe_fraction": 1.0,
+      "policy_hz": 40.256410256410255,
+      "physics_steps": 3196,
+      "physics_hz": 199.9373629815083,
+      "physics_wall_hz": 162.12921576594877,
+      "max_inference_ms": 0.9534,
+      "inference_p99_ms": 0.6339949999999999,
+      "max_projected_gravity_xy": 0.3579079798757908,
+      "max_joint_limit_violation_rad": 0.00824330611350299,
+      "forbidden_ground_contact_steps": 0,
+      "sequence_reset_count": 0,
+      "mid_interval_action_change_count": 0,
+      "non_decimated_policy_step_count": 0,
+      "first_failure_sequence": null,
+      "first_failure_time": null,
+      "first_failure_reason": null,
+      "passed": false,
+      "failures": [
+        "policy frequency is 40.26 Hz, expected 50 Hz +/-5%",
+        "physics wall-clock frequency is 162.13 Hz, expected 200 Hz +/-5%"
+      ]
+    },
+    {
+      "model_profile": "model_73500",
+      "policy_steps": 890,
+      "safe_steps": 866,
+      "safe_fraction": 1.0,
+      "policy_hz": 44.39540135495791,
+      "physics_steps": 3596,
+      "physics_hz": 199.8331015298948,
+      "physics_wall_hz": 178.20996229410596,
+      "max_inference_ms": 0.8136,
+      "inference_p99_ms": 0.5811150000000002,
+      "max_projected_gravity_xy": 0.7328081741594737,
+      "max_joint_limit_violation_rad": 0.0013297445538589248,
+      "forbidden_ground_contact_steps": 340,
+      "sequence_reset_count": 0,
+      "mid_interval_action_change_count": 0,
+      "non_decimated_policy_step_count": 0,
+      "first_failure_sequence": null,
+      "first_failure_time": null,
+      "first_failure_reason": null,
+      "passed": false,
+      "failures": [
+        "policy frequency is 44.40 Hz, expected 50 Hz +/-5%",
+        "physics wall-clock frequency is 178.21 Hz, expected 200 Hz +/-5%",
+        "forbidden pelvis/torso/hip ground contact at sim_time=11.215s"
+      ]
+    }
+  ]
+}

@@ -15,6 +15,10 @@ from deploy.common.control import PDController
 from deploy.common.kinematics import MujocoKinematicsProvider
 from deploy.common.jsonl import JsonlRecorder
 from deploy.common.mapping import RobotDescription
+from deploy.common.model_manifest import (
+    manifest_identity,
+    validate_model_manifest,
+)
 from deploy.common.observation import ObservationBuilder
 from deploy.common.safety import SafetyGate
 from deploy.policy.backends import UdpPolicyBackend
@@ -40,6 +44,16 @@ class OperatorState:
     def request_quit(self) -> None:
         with self._lock:
             self.quit = True
+
+
+def classify_sequence(current: int, previous: int) -> str:
+    """Classify a state sequence without treating duplicates as resets."""
+
+    if previous < 0 or current > previous:
+        return "new"
+    if current == previous:
+        return "duplicate"
+    return "reset"
 
 
 def _console_loop(operator: OperatorState, safety: SafetyGate) -> None:
@@ -99,6 +113,7 @@ def _make_backend(cfg, *, mode: str, transport: str, write_enabled: bool):
         RobotDescription.from_urdf(cfg.urdf_path),
         pelvis_body=cfg.section("robot")["base_body"],
         torso_body=cfg.section("robot")["torso_body"],
+        policy_frame_body=cfg.section("robot")["policy_frame"],
         end_effector_names=tuple(cfg.section("robot")["end_effectors"]),
     )
     from deploy.sim2real.unitree_backend import UnitreePolicyBackend
@@ -124,7 +139,13 @@ def main() -> None:
     parser.add_argument("--config", default="deploy/config/g1_carrybox.yaml")
     parser.add_argument("--mode", choices=("sim2sim", "sim2real"), default="sim2sim")
     parser.add_argument("--transport", choices=("unitree_dds", "udp"))
+    parser.add_argument(
+        "--profile", help="named policy profile from the deployment YAML"
+    )
     parser.add_argument("--model", help="override ONNX model")
+    parser.add_argument(
+        "--manifest", help="manifest required with an ONNX override"
+    )
     parser.add_argument("--arm", action="store_true", help="start armed (sim recommended)")
     parser.add_argument(
         "--allow-hardware-command",
@@ -137,13 +158,42 @@ def main() -> None:
 
     cfg = load_deploy_config(args.config)
     transport = args.transport or cfg.section("simulation")["transport"]
-    model_path = cfg.resolve_path(args.model) if args.model else cfg.onnx_path
+    profile = args.profile or cfg.default_policy_profile
+    if args.model:
+        if not args.manifest:
+            raise ValueError("--model requires --manifest for identity validation")
+        model_path = cfg.resolve_path(args.model)
+        manifest_path = cfg.resolve_path(args.manifest)
+        checkpoint_path = None
+    else:
+        model_path = cfg.onnx_path_for(profile)
+        manifest_path = cfg.manifest_path_for(profile)
+        checkpoint_path = cfg.checkpoint_path_for(profile)
     if not model_path.exists():
         raise FileNotFoundError(
             f"ONNX actor not found: {model_path}\n"
             "Run: python -m deploy.tools.export_actor "
-            "--checkpoint legged_gym/logs/Jul09_from_55500/model_73500.pt"
+            f"--profile {profile}"
         )
+    control_cfg = cfg.section("control")
+    robot_cfg = cfg.section("robot")
+    manifest = validate_model_manifest(
+        manifest_path,
+        model_path,
+        profile=profile,
+        policy_frame=str(robot_cfg["policy_frame"]),
+        action_scale=float(control_cfg["action_scale"]),
+        physics_hz=int(control_cfg["physics_hz"]),
+        policy_hz=int(control_cfg["policy_hz"]),
+        checkpoint_path=checkpoint_path,
+    )
+    model_identity = manifest_identity(manifest)
+    print(
+        "Validated policy model: "
+        f"profile={model_identity['profile']} "
+        f"checkpoint_sha256={model_identity['checkpoint_sha256']} "
+        f"onnx_sha256={model_identity['onnx_sha256']}"
+    )
 
     safety_cfg = cfg.section("safety")
     configured_dry_run = bool(safety_cfg["dry_run"])
@@ -160,7 +210,6 @@ def main() -> None:
 
     robot = RobotDescription.from_urdf(cfg.urdf_path)
     policy_cfg = cfg.section("policy")
-    control_cfg = cfg.section("control")
     builder = ObservationBuilder(
         DEFAULT_DOF_POS,
         clip=float(policy_cfg["clip_observations"]),
@@ -176,12 +225,28 @@ def main() -> None:
     )
     safety = SafetyGate(
         robot,
-        max_robot_state_age_ms=float(safety_cfg["max_robot_state_age_ms"]),
-        max_task_state_age_ms=float(safety_cfg["max_task_state_age_ms"]),
+        max_robot_state_age_ms=float(
+            safety_cfg.get("sim_max_robot_state_age_ms", 100.0)
+            if args.mode == "sim2sim"
+            else safety_cfg["max_robot_state_age_ms"]
+        ),
+        max_task_state_age_ms=float(
+            safety_cfg.get("sim_max_task_state_age_ms", 100.0)
+            if args.mode == "sim2sim"
+            else safety_cfg["max_task_state_age_ms"]
+        ),
         max_projected_gravity_xy=float(
             safety_cfg["max_projected_gravity_xy"]
         ),
         joint_limit_margin=float(safety_cfg["joint_limit_margin"]),
+        sim_joint_limit_tolerance=float(
+            safety_cfg.get("sim_joint_limit_tolerance", 0.02)
+        ),
+        profile=(
+            str(control_cfg["sim_profile"])
+            if args.mode == "sim2sim"
+            else str(control_cfg["hardware_profile"])
+        ),
     )
     core = PolicyCore(
         OnnxActor(model_path),
@@ -196,6 +261,15 @@ def main() -> None:
         write_enabled=write_enabled,
     )
     recorder = JsonlRecorder(args.log)
+    recorder.write(
+        {
+            "kind": "run_metadata",
+            "component": "policy",
+            "mode": args.mode,
+            "transport": transport,
+            "model": model_identity,
+        }
+    )
     operator = OperatorState(armed=args.arm)
     if args.mode == "sim2real" and args.arm and not write_enabled:
         print("Real backend is armed for inference only; hardware writes are disabled")
@@ -205,12 +279,19 @@ def main() -> None:
         ).start()
 
     policy_period = 1.0 / float(control_cfg["policy_hz"])
+    loop_period = (
+        min(policy_period, 0.0005)
+        if args.mode == "sim2sim"
+        else policy_period
+    )
+    sim_decimation = int(control_cfg["decimation"])
     next_tick = time.perf_counter()
     start_time = next_tick
     last_armed = False
     armed_since: float | None = None
     last_log = start_time
     last_robot_sequence = -1
+    last_block_signature: tuple[int, str] | None = None
     try:
         while True:
             armed, quit_requested = operator.snapshot()
@@ -220,9 +301,16 @@ def main() -> None:
                 break
             robot_state, task_state = backend.poll()
             if robot_state is not None and task_state is not None:
-                state_sequence_reset = (
-                    last_robot_sequence >= 0
-                    and robot_state.sequence <= last_robot_sequence
+                sequence_state = classify_sequence(
+                    robot_state.sequence, last_robot_sequence
+                )
+                state_sequence_reset = sequence_state == "reset"
+                state_due = (
+                    sequence_state == "reset"
+                    or last_robot_sequence < 0
+                    or robot_state.sequence - last_robot_sequence
+                    >= sim_decimation
+                    or args.mode != "sim2sim"
                 )
                 if (armed and not last_armed) or state_sequence_reset:
                     core.reset(robot_state)
@@ -238,13 +326,21 @@ def main() -> None:
                 if (
                     armed
                     and not decision.allowed
-                    and decision.reason != "dry-run blocks command output"
+                    and decision.latch
                 ):
                     operator.set_armed(False)
                     armed = False
+                block_signature = (
+                    int(robot_state.sequence),
+                    str(decision.reason),
+                )
+                emit_block = (
+                    not decision.allowed
+                    and block_signature != last_block_signature
+                )
                 if (
-                    robot_state.sequence != last_robot_sequence
-                    or state_sequence_reset
+                    state_due
+                    or emit_block
                 ):
                     gain_ramp = 1.0
                     if args.mode == "sim2real":
@@ -284,6 +380,10 @@ def main() -> None:
                     if armed and decision.allowed and not step.command.armed:
                         operator.set_armed(False)
                         armed = False
+                    # Command sequence identifies the source LowState/MuJoCo
+                    # state. The simulator latches it only on decimation
+                    # boundaries, so targets never change mid 4-step interval.
+                    step.command.sequence = robot_state.sequence
                     backend.send(step.command)
                     recorder.write(
                         {
@@ -299,8 +399,14 @@ def main() -> None:
                             "kd": step.command.kd,
                             "command_armed": step.command.armed,
                             "command_reason": step.command.reason,
+                            "safety_warnings": list(decision.warnings),
+                            "episode_failed": decision.episode_failed,
+                            "state_sequence_reset": state_sequence_reset,
                             "inference_time_ms": step.inference_time_ms,
                         }
+                    )
+                    last_block_signature = (
+                        None if decision.allowed else block_signature
                     )
                     last_robot_sequence = robot_state.sequence
                     now = time.perf_counter()
@@ -315,7 +421,7 @@ def main() -> None:
                         )
                         last_log = now
             last_armed = armed
-            next_tick += policy_period
+            next_tick += loop_period
             delay = next_tick - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)

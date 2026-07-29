@@ -16,8 +16,9 @@ from deploy.common.kinematics import MujocoKinematicsProvider
 from deploy.common.mapping import validate_motor_mapping
 from deploy.common.math_utils import (
     normalize_quat_wxyz,
+    quat_conjugate_wxyz,
     quat_multiply_wxyz,
-    quat_rotate_inverse_wxyz,
+    quat_rotate_wxyz,
 )
 from deploy.common.types import PolicyCommand, RobotState, TaskState
 from deploy.sim2real.task_provider import (
@@ -107,18 +108,21 @@ class UnitreePolicyBackend:
             message.imu_state.quaternion, dtype=np.float64
         ).reshape(4)
         imu_gyro = np.asarray(message.imu_state.gyroscope, dtype=np.float64)
-        if self._imu_frame == "pelvis":
+        if self._imu_frame == "torso":
             norm = float(np.linalg.norm(imu_quat))
             if np.isfinite(norm) and abs(norm - 1.0) <= 1e-3:
                 pelvis_to_torso, relative_gyro = (
                     self.kinematics.torso_relative_state(joint_pos, joint_vel)
                 )
                 imu_quat = normalize_quat_wxyz(
-                    quat_multiply_wxyz(imu_quat, pelvis_to_torso)
+                    quat_multiply_wxyz(
+                        imu_quat,
+                        quat_conjugate_wxyz(pelvis_to_torso),
+                    )
                 )
-                imu_gyro = (
-                    quat_rotate_inverse_wxyz(pelvis_to_torso, imu_gyro)
-                    + relative_gyro
+                imu_gyro = quat_rotate_wxyz(
+                    pelvis_to_torso,
+                    imu_gyro - relative_gyro,
                 )
         tick = int(getattr(message, "tick", 0))
         if self._last_tick is not None and tick < self._last_tick:
@@ -128,11 +132,11 @@ class UnitreePolicyBackend:
         state = RobotState(
             sequence=self._sequence,
             timestamp_ns=now,
-            torso_quat_wxyz=imu_quat,
-            torso_ang_vel=imu_gyro,
+            policy_frame_quat_wxyz=imu_quat,
+            policy_frame_ang_vel=imu_gyro,
             joint_pos=joint_pos,
             joint_vel=joint_vel,
-            end_effector_pos_torso=endpoints,
+            end_effector_pos_policy_frame=endpoints,
         )
         with self._lock:
             self._latest_robot = state

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,11 @@ from deploy.common.constants import (
     JOINT_NAMES,
     OBSERVATION_SLICES,
 )
+from deploy.common.model_manifest import (
+    MANIFEST_FORMAT_VERSION,
+    sha256_file,
+)
+from deploy.common.transport import VERSION as TRANSPORT_VERSION
 
 ACTOR_KEYS = (
     "actor.0.weight",
@@ -95,14 +99,6 @@ def load_actor_from_checkpoint(checkpoint_path: str | Path) -> CarryBoxActor:
     return actor
 
 
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def export_actor(
     checkpoint_path: str | Path,
     onnx_path: str | Path,
@@ -111,6 +107,8 @@ def export_actor(
     action_scale: float = 0.25,
     physics_hz: int = 200,
     policy_hz: int = 50,
+    profile: str = "default",
+    policy_frame: str = "pelvis",
     verify: bool = True,
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_path).resolve()
@@ -157,7 +155,10 @@ def export_actor(
             )
 
     manifest: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": MANIFEST_FORMAT_VERSION,
+        "profile": str(profile),
+        "policy_frame": str(policy_frame),
+        "transport_protocol_version": TRANSPORT_VERSION,
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "onnx": str(onnx_path),
@@ -199,18 +200,42 @@ def main() -> None:
         "--config", default="deploy/config/g1_carrybox.yaml", help="deployment YAML"
     )
     parser.add_argument("--checkpoint", help="override checkpoint path")
+    parser.add_argument(
+        "--profile",
+        help="named policy profile; defaults to policy.default_profile",
+    )
     parser.add_argument("--output", help="override ONNX output path")
     parser.add_argument("--manifest", help="override manifest output path")
     parser.add_argument("--no-verify", action="store_true")
     args = parser.parse_args()
 
     cfg = load_deploy_config(args.config)
-    checkpoint = Path(args.checkpoint).resolve() if args.checkpoint else cfg.checkpoint_path
-    output = Path(args.output).resolve() if args.output else cfg.onnx_path
+    profile = args.profile or cfg.default_policy_profile
+    configured_checkpoint = cfg.checkpoint_path_for(profile)
+    checkpoint = (
+        Path(args.checkpoint).resolve()
+        if args.checkpoint
+        else configured_checkpoint
+    )
+    if (
+        checkpoint != configured_checkpoint
+        and args.output is None
+        and args.manifest is None
+    ):
+        raise ValueError(
+            "checkpoint override does not match the selected profile; "
+            "also pass --output and --manifest to avoid overwriting a "
+            "different model"
+        )
+    output = (
+        Path(args.output).resolve()
+        if args.output
+        else cfg.onnx_path_for(profile)
+    )
     manifest = (
         Path(args.manifest).resolve()
         if args.manifest
-        else cfg.resolve_path(cfg.section("policy")["manifest_path"])
+        else cfg.manifest_path_for(profile)
     )
     result = export_actor(
         checkpoint,
@@ -219,6 +244,8 @@ def main() -> None:
         action_scale=float(cfg.section("control")["action_scale"]),
         physics_hz=int(cfg.section("control")["physics_hz"]),
         policy_hz=int(cfg.section("control")["policy_hz"]),
+        profile=profile,
+        policy_frame=str(cfg.section("robot")["policy_frame"]),
         verify=not args.no_verify,
     )
     print(

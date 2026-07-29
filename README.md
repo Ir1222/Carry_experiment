@@ -69,6 +69,12 @@ cd .. && pip install -r requirements.txt
 
 PhysHSI supports six tasks for the Unitree G1 humanoid robot: **CarryBox, SitDown, LieDown, StandUp, StyleLoco-Dinosaur,** and **StyleLoco-Highknee**.
 
+The CarryBox MuJoCo Sim2Sim and Unitree G1 Sim2Real dry-run workflow is
+documented in [deploy/README.md](deploy/README.md). It includes read-only
+preflight checks, named/checksummed model profiles, a strict one-command
+dual-model UDP validator, Unitree DDS setup, and a safety-locked real-robot
+inference dry-run.
+
 ### Motion Visualization
 
 Reference motion data for each task can be found in the [motion data folder](legged_gym/resources/dataset/). To visualize reference motion data, run:

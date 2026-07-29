@@ -1,0 +1,51 @@
+{
+  "format_version": 1,
+  "config": "D:\\AAAProject\\base_experi\\PhysHSI\\deploy\\config\\g1_carrybox.yaml",
+  "duration_seconds": 20.0,
+  "warmup_seconds": 0.5,
+  "all_passed": false,
+  "models": [
+    {
+      "model_profile": "official_carrybox_65000",
+      "policy_steps": 973,
+      "safe_steps": 949,
+      "safe_fraction": 1.0,
+      "policy_hz": 48.61538461538461,
+      "physics_steps": 3596,
+      "physics_hz": 199.944336209288,
+      "physics_wall_hz": 194.99484284240813,
+      "max_inference_ms": 1.6342,
+      "inference_p99_ms": 0.48829599999999973,
+      "max_projected_gravity_xy": 0.3579079798757908,
+      "max_joint_limit_violation_rad": 0.00824330611350299,
+      "forbidden_ground_contact_steps": 0,
+      "sequence_reset_count": 0,
+      "mid_interval_action_change_count": 0,
+      "non_decimated_policy_step_count": 0,
+      "passed": true,
+      "failures": []
+    },
+    {
+      "model_profile": "model_73500",
+      "policy_steps": 996,
+      "safe_steps": 972,
+      "safe_fraction": 1.0,
+      "policy_hz": 49.794871794871796,
+      "physics_steps": 3996,
+      "physics_hz": 199.94991234660347,
+      "physics_wall_hz": 199.14197346103958,
+      "max_inference_ms": 2.8248,
+      "inference_p99_ms": 0.3763089999999999,
+      "max_projected_gravity_xy": 0.7328081741594737,
+      "max_joint_limit_violation_rad": 0.0013297445538589248,
+      "forbidden_ground_contact_steps": 441,
+      "sequence_reset_count": 0,
+      "mid_interval_action_change_count": 0,
+      "non_decimated_policy_step_count": 0,
+      "passed": false,
+      "failures": [
+        "forbidden pelvis/torso/hip ground contact at sim_time=11.185s"
+      ]
+    }
+  ]
+}

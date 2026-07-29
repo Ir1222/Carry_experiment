@@ -1,9 +1,16 @@
 project_root: ../..
 
 policy:
-  checkpoint: legged_gym/logs/Jul09_from_55500/model_73500.pt
-  onnx_path: deploy/models/carrybox_73500.onnx
-  manifest_path: deploy/models/carrybox_73500.manifest.json
+  default_profile: model_73500
+  profiles:
+    official_carrybox_65000:
+      checkpoint: legged_gym/resources/ckpt/carrybox.pt
+      onnx_path: deploy/models/official_carrybox_65000.onnx
+      manifest_path: deploy/models/official_carrybox_65000.manifest.json
+    model_73500:
+      checkpoint: legged_gym/logs/Jul09_from_55500/model_73500.pt
+      onnx_path: deploy/models/carrybox_73500.onnx
+      manifest_path: deploy/models/carrybox_73500.manifest.json
   actor_obs_dim: 738
   frame_obs_dim: 123
   history_length: 6
@@ -17,6 +24,7 @@ robot:
   urdf: legged_gym/resources/robots/g1/urdf/g1_29dof.urdf
   base_body: pelvis
   torso_body: torso_link
+  policy_frame: pelvis
   imu_frame: torso
   end_effectors:
     - left_palm_link
@@ -40,6 +48,13 @@ control:
 simulation:
   physics_dt: 0.005
   joint_armature: 0.01
+  contact_margin: 0.01
+  joint_limit_solref: [0.01, 1.0]
+  joint_limit_solimp: [0.99, 0.999, 0.001, 0.5, 2.0]
+  disable_refsafe_for_joint_limits: false
+  body_linear_damping: 0.01
+  body_angular_damping: 0.01
+  policy_boundary_timeout_ms: 100.0
   mjcf: deploy/assets/g1_carrybox.xml
   generated_robot_mjcf: deploy/assets/g1_29dof_physhsi_generated.xml
   realtime: true
@@ -49,11 +64,18 @@ simulation:
   robot_initial_quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
   box_size: [0.30, 0.30, 0.25]
   box_density: 50.0
-  box_initial_position: [1.0, 0.0, 0.135]
+  # Isaac Gym default play reset is robot x=2.3 with yaw=pi and box x=0.55,
+  # which is exactly +1.75 m in the pelvis/policy frame.
+  box_initial_position: [1.75, 0.0, 0.135]
   box_initial_quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
   goal_position: [2.5, 0.75, 0.145]
   success_position_threshold: 0.10
   success_tilt_threshold: 0.20
+  termination_head_height: 0.60
+  termination_root_height: 0.20
+  termination_hip_yaw_height: 0.15
+  termination_roll_abs: 0.50
+  termination_pitch_abs: 1.10
 
 network:
   domain_id: 0
@@ -69,5 +91,8 @@ safety:
   command_stale_timeout_ms: 100.0
   max_robot_state_age_ms: 40.0
   max_task_state_age_ms: 100.0
+  sim_max_robot_state_age_ms: 100.0
+  sim_max_task_state_age_ms: 100.0
   max_projected_gravity_xy: 0.8
   joint_limit_margin: 0.02
+  sim_joint_limit_tolerance: 0.02

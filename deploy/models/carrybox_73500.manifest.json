@@ -1,5 +1,8 @@
 {
-  "format_version": 1,
+  "format_version": 2,
+  "profile": "model_73500",
+  "policy_frame": "pelvis",
+  "transport_protocol_version": 2,
   "checkpoint": "D:\\AAAProject\\base_experi\\PhysHSI\\legged_gym\\logs\\Jul09_from_55500\\model_73500.pt",
   "checkpoint_sha256": "9b7c32dea0498af448bedf67af1f6ef21d6937faed0af35a1caaac58eede4c45",
   "onnx": "D:\\AAAProject\\base_experi\\PhysHSI\\deploy\\models\\carrybox_73500.onnx",

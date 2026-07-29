@@ -11,7 +11,9 @@ import numpy as np
 from .constants import ACTION_DIM
 from .types import PolicyCommand, RobotState, TaskState
 
-VERSION = 1
+# Version 2 changes frame-dependent robot/task fields from torso semantics to
+# the configured policy frame. V1 packets are intentionally rejected.
+VERSION = 2
 KIND_ROBOT = 1
 KIND_TASK = 2
 KIND_COMMAND = 3
@@ -45,11 +47,11 @@ def _unpack(payload: bytes, expected_kind: int, expected_floats: int):
 def pack_robot_state(state: RobotState) -> bytes:
     values = np.concatenate(
         (
-            state.torso_quat_wxyz,
-            state.torso_ang_vel,
+            state.policy_frame_quat_wxyz,
+            state.policy_frame_ang_vel,
             state.joint_pos,
             state.joint_vel,
-            state.end_effector_pos_torso.reshape(-1),
+            state.end_effector_pos_policy_frame.reshape(-1),
         )
     )
     return _pack(KIND_ROBOT, state.sequence, state.timestamp_ns, values)
@@ -62,21 +64,21 @@ def unpack_robot_state(payload: bytes) -> RobotState:
     return RobotState(
         sequence=sequence,
         timestamp_ns=timestamp_ns,
-        torso_quat_wxyz=values[0:4],
-        torso_ang_vel=values[4:7],
+        policy_frame_quat_wxyz=values[0:4],
+        policy_frame_ang_vel=values[4:7],
         joint_pos=values[7:36],
         joint_vel=values[36:65],
-        end_effector_pos_torso=values[65:80],
+        end_effector_pos_policy_frame=values[65:80],
     )
 
 
 def pack_task_state(state: TaskState) -> bytes:
     values = np.concatenate(
         (
-            state.box_pos_torso,
-            state.box_quat_torso_wxyz,
+            state.box_pos_policy_frame,
+            state.box_quat_policy_frame_wxyz,
             state.box_size,
-            state.goal_pos_torso,
+            state.goal_pos_policy_frame,
         )
     )
     flags = FLAG_ACTIVE if state.success else 0
@@ -90,10 +92,10 @@ def unpack_task_state(payload: bytes) -> TaskState:
     return TaskState(
         sequence=sequence,
         timestamp_ns=timestamp_ns,
-        box_pos_torso=values[0:3],
-        box_quat_torso_wxyz=values[3:7],
+        box_pos_policy_frame=values[0:3],
+        box_quat_policy_frame_wxyz=values[3:7],
         box_size=values[7:10],
-        goal_pos_torso=values[10:13],
+        goal_pos_policy_frame=values[10:13],
         success=bool(flags & FLAG_ACTIVE),
     )
 
