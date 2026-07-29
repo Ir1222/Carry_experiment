@@ -93,6 +93,36 @@ python -m deploy.policy.run \
   --log ~/physhsi_deploy_logs/policy_udp.jsonl
 ```
 
+### D455 first-person camera
+
+The generated robot MJCF contains a massless, collision-free
+`d455_camera` attached to the trained `d455_link` optical frame. Rebuild once
+after updating the deployment package:
+
+```bash
+python -m deploy.tools.build_mjcf
+```
+
+Start directly in the D455 view:
+
+```bash
+python -m deploy.sim2sim.mujoco_server \
+  --config deploy/config/g1_carrybox.yaml \
+  --transport udp \
+  --camera-view d455 \
+  --log ~/physhsi_deploy_logs/d455_mujoco.jsonl
+```
+
+Press `C` to toggle between the free third-person camera and D455. The camera
+uses the repository's D455 extrinsics and an 848x480 depth-style field of view
+(57.5 degree vertical, 88.21 degree derived horizontal). It is visualization
+only and does not enter the actor observation.
+
+At every 50 Hz policy boundary the MuJoCo log records `box_center_uv`,
+`box_bbox_uv`, `center_depth_m`, `partially_visible`, `fully_visible`, and
+`behind_camera`. Pixel coordinates always refer to the fixed 848x480
+intrinsics, independent of the desktop window size.
+
 `--arm` is the safety permission to send the inferred joint targets; it is
 independent of the task's box start and goal. The automatic validator supplies
 this permission after it receives valid synchronized robot/task state.
@@ -159,7 +189,8 @@ python -m deploy.policy.run \
 Keep `network.interface: lo` and `domain_id: 0` when both processes run on the
 same host. Box and goal task state still use UDP `127.0.0.1:15001`.
 
-The MuJoCo window accepts Backspace to reset and Q/Escape to quit. The policy
+The MuJoCo window accepts Backspace to reset, C to toggle free/D455 view, and
+Q/Escape to quit. The policy
 terminal accepts these commands followed by Enter:
 
 - `]` or `arm`: arm policy.

@@ -9,7 +9,7 @@
 
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
-    <global azimuth="-125" elevation="-18"/>
+    <global azimuth="-125" elevation="-18" offwidth="848" offheight="480"/>
   </visual>
 
   <asset>

@@ -34,6 +34,19 @@ robot:
     - mid360_link
   policy_to_motor: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
 
+camera:
+  name: d455_camera
+  body: d455_link
+  position: [0.0, 0.0, 0.0]
+  # RealSense optical frame (+Z forward, +X right, +Y down) to
+  # MuJoCo camera frame (-Z forward, +X right, +Y up).
+  quaternion_wxyz: [0.0, 1.0, 0.0, 0.0]
+  width: 848
+  height: 480
+  vertical_fov_deg: 57.5
+  near_m: 0.05
+  far_m: 5.0
+
 control:
   physics_hz: 200
   policy_hz: 50

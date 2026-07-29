@@ -107,6 +107,7 @@ def _make_backend(cfg, *, mode: str, transport: str, write_enabled: bool):
             joint_armature=float(
                 cfg.section("simulation").get("joint_armature", 0.01)
             ),
+            camera_config=cfg.section("camera"),
         )
     kinematics = MujocoKinematicsProvider(
         generated,

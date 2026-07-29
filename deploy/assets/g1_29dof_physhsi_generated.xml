@@ -148,7 +148,9 @@
             <body name="imu_in_torso" pos="-0.03959 -0.00224 0.14792" />
             <body name="d435_link" pos="0.0576235 0.01753 0.42987" quat="0.91496 0 0.403545 0" />
             <body name="temp_link" pos="0.081719 0.009997 0.400382" quat="0.908872 0 0.417074 0">
-              <body name="d455_link" quat="0.499998 -0.5 0.500002 -0.5" />
+              <body name="d455_link" quat="0.499998 -0.5 0.500002 -0.5">
+                <camera name="d455_camera" mode="fixed" pos="0 0 0" quat="0 1 0 0" fovy="57.5" resolution="848 480" />
+              </body>
             </body>
             <body name="mid360_link" pos="0.0002835 3e-05 0.41618" quat="0.999799 0 0.0200699 0" />
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.24778" quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">

@@ -8,6 +8,10 @@ import time
 
 import numpy as np
 
+from deploy.common.camera import (
+    CameraIntrinsics,
+    project_box_to_camera,
+)
 from deploy.common.config import load_deploy_config
 from deploy.common.constants import DEFAULT_DOF_POS, KD, KP
 from deploy.common.kinematics import (
@@ -41,13 +45,20 @@ def _require_mujoco():
 
 class MujocoServer:
     def __init__(
-        self, config, *, transport: str, viewer: bool, log_path=None
+        self,
+        config,
+        *,
+        transport: str,
+        viewer: bool,
+        camera_view: str = "free",
+        log_path=None,
     ) -> None:
         self.cfg = config
         self.sim_cfg = config.section("simulation")
         self.control_cfg = config.section("control")
         self.network_cfg = config.section("network")
         self.robot_cfg = config.section("robot")
+        self.camera_cfg = config.section("camera")
         self.mujoco = _require_mujoco()
         generated = config.resolve_path(self.sim_cfg["generated_robot_mjcf"])
         if not generated.exists():
@@ -56,6 +67,7 @@ class MujocoServer:
                 config.urdf_path,
                 generated,
                 joint_armature=float(self.sim_cfg.get("joint_armature", 0.01)),
+                camera_config=self.camera_cfg,
             )
         self.model = self.mujoco.MjModel.from_xml_path(str(config.mjcf_path))
         self.data = self.mujoco.MjData(self.model)
@@ -73,12 +85,19 @@ class MujocoServer:
             raise RuntimeError("generated MJCF does not contain all 29 named actuators")
         self.transport_name = transport
         self.viewer_enabled = viewer
+        if camera_view not in ("free", "d455"):
+            raise ValueError(
+                "camera_view must be either 'free' or 'd455'"
+            )
+        self.camera_view = camera_view
+        self._viewer_camera_dirty = True
         self.recorder = JsonlRecorder(log_path)
         self.sequence = 0
         self.reset_requested = False
         self.stop_requested = False
         self._configure_transport()
         self._configure_scene()
+        self._configure_camera()
         self.physics_fingerprint = self._configure_physics_profile()
         print(
             "MuJoCo physics profile: "
@@ -91,6 +110,7 @@ class MujocoServer:
                 "protocol_version": 2,
                 "policy_frame": self.robot_cfg["policy_frame"],
                 "physics": self.physics_fingerprint,
+                "camera": self.camera_metadata,
             }
         )
         self.reset()
@@ -152,6 +172,83 @@ class MujocoServer:
             * np.asarray((y * y + z * z, x * x + z * z, x * x + y * y))
         )
         self.model.site_pos[self.goal_site_id] = self.goal_position
+
+    def _configure_camera(self) -> None:
+        camera_name = str(self.camera_cfg["name"])
+        camera_body_name = str(self.camera_cfg["body"])
+        try:
+            self.camera_id = int(self.model.camera(camera_name).id)
+            self.camera_body_id = int(
+                self.model.body(camera_body_name).id
+            )
+        except KeyError as exc:
+            raise RuntimeError(
+                "generated MJCF does not contain the configured D455 "
+                "camera; run `python -m deploy.tools.build_mjcf`"
+            ) from exc
+        actual_body_id = int(self.model.cam_bodyid[self.camera_id])
+        if actual_body_id != self.camera_body_id:
+            actual_body = self.model.body(actual_body_id).name
+            raise RuntimeError(
+                f"camera {camera_name!r} belongs to {actual_body!r}, "
+                f"expected {camera_body_name!r}"
+            )
+        self.camera_intrinsics = CameraIntrinsics.from_config(
+            self.camera_cfg
+        )
+        self.camera_metadata = {
+            "name": camera_name,
+            "body": camera_body_name,
+            "position": [
+                float(value) for value in self.camera_cfg["position"]
+            ],
+            "quaternion_wxyz": [
+                float(value)
+                for value in self.camera_cfg["quaternion_wxyz"]
+            ],
+            **self.camera_intrinsics.to_dict(),
+        }
+
+    def _validate_camera_axes(self) -> None:
+        camera_rotation = self.data.cam_xmat[
+            self.camera_id
+        ].reshape(3, 3)
+        optical_rotation = self.data.xmat[
+            self.camera_body_id
+        ].reshape(3, 3)
+        camera_right = camera_rotation[:, 0]
+        camera_up = camera_rotation[:, 1]
+        camera_forward = -camera_rotation[:, 2]
+        expected_right = optical_rotation[:, 0]
+        expected_up = -optical_rotation[:, 1]
+        expected_forward = optical_rotation[:, 2]
+        if not (
+            np.allclose(camera_right, expected_right, atol=1e-6)
+            and np.allclose(camera_up, expected_up, atol=1e-6)
+            and np.allclose(
+                camera_forward, expected_forward, atol=1e-6
+            )
+        ):
+            raise RuntimeError(
+                "D455 camera axes do not match RealSense optical "
+                "frame (+Z forward, +X right, +Y down)"
+            )
+
+    def box_camera_projection(self) -> dict[str, object]:
+        return project_box_to_camera(
+            camera_position_world=self.data.cam_xpos[
+                self.camera_id
+            ],
+            camera_rotation_to_world=self.data.cam_xmat[
+                self.camera_id
+            ].reshape(3, 3),
+            box_position_world=self.data.xpos[self.box_body_id],
+            box_rotation_to_world=self.data.xmat[
+                self.box_body_id
+            ].reshape(3, 3),
+            box_half_size=self.box_size / 2.0,
+            intrinsics=self.camera_intrinsics,
+        )
 
     def _configure_physics_profile(self) -> dict:
         contact_margin = float(self.sim_cfg.get("contact_margin", 0.0))
@@ -239,6 +336,7 @@ class MujocoServer:
             self.sim_cfg["box_initial_quaternion_wxyz"], dtype=np.float64
         )
         self.mujoco.mj_forward(self.model, self.data)
+        self._validate_camera_axes()
         self.sequence = 0
         if self.unitree_bridge is not None:
             self.unitree_bridge.clear_command()
@@ -612,6 +710,7 @@ class MujocoServer:
         )
         if not detailed_log:
             return
+        camera_projection = self.box_camera_projection()
         record = {
             "kind": "mujoco_step",
             "wall_timestamp_ns": time.monotonic_ns(),
@@ -651,6 +750,8 @@ class MujocoServer:
                 self._interval_ground_contact_bodies
             ),
             "detail": detailed_log,
+            "camera_view": self.camera_view,
+            **camera_projection,
         }
         if detailed_log:
             record.update(
@@ -687,8 +788,30 @@ class MujocoServer:
     def _key_callback(self, keycode: int) -> None:
         if keycode == 259:  # GLFW_BACKSPACE
             self.reset_requested = True
+        elif keycode == 67:  # GLFW_C
+            self.camera_view = (
+                "free" if self.camera_view == "d455" else "d455"
+            )
+            self._viewer_camera_dirty = True
+            print(f"MuJoCo viewer camera: {self.camera_view}")
         elif keycode in (81, 256):  # Q or ESC
             self.stop_requested = True
+
+    def _apply_viewer_camera(self, viewer_context) -> None:
+        if not self._viewer_camera_dirty:
+            return
+        with viewer_context.lock():
+            if self.camera_view == "d455":
+                viewer_context.cam.type = (
+                    self.mujoco.mjtCamera.mjCAMERA_FIXED
+                )
+                viewer_context.cam.fixedcamid = self.camera_id
+            else:
+                viewer_context.cam.type = (
+                    self.mujoco.mjtCamera.mjCAMERA_FREE
+                )
+                viewer_context.cam.fixedcamid = -1
+        self._viewer_camera_dirty = False
 
     @staticmethod
     def _wait_until(deadline: float) -> None:
@@ -713,6 +836,7 @@ class MujocoServer:
             viewer_context = self.mujoco.viewer.launch_passive(
                 self.model, self.data, key_callback=self._key_callback
             )
+            self._apply_viewer_camera(viewer_context)
         else:
             viewer_context = None
         try:
@@ -727,6 +851,7 @@ class MujocoServer:
                     self.reset()
                 self.step()
                 if viewer_context is not None:
+                    self._apply_viewer_camera(viewer_context)
                     viewer_context.sync()
                 if bool(self.sim_cfg.get("realtime", True)):
                     next_tick += period
@@ -751,6 +876,12 @@ def main() -> None:
     parser.add_argument("--config", default="deploy/config/g1_carrybox.yaml")
     parser.add_argument("--transport", choices=("unitree_dds", "udp"))
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--camera-view",
+        choices=("free", "d455"),
+        default="free",
+        help="initial MuJoCo viewer camera; press C to toggle",
+    )
     parser.add_argument("--log", help="optional per-physics-step JSONL log")
     parser.add_argument("--duration", type=float, help="optional wall-clock duration")
     args = parser.parse_args()
@@ -759,6 +890,7 @@ def main() -> None:
         cfg,
         transport=args.transport or cfg.section("simulation")["transport"],
         viewer=bool(cfg.section("simulation")["viewer"]) and not args.headless,
+        camera_view=args.camera_view,
         log_path=args.log,
     )
     server.run(duration=args.duration)

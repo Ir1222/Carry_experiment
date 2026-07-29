@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,7 @@ def _validate(cfg: DeployConfig) -> None:
     control = cfg.section("control")
     simulation = cfg.section("simulation")
     robot = cfg.section("robot")
+    camera = cfg.section("camera")
 
     expected = {
         "actor_obs_dim": ACTOR_OBS_DIM,
@@ -150,6 +152,50 @@ def _validate(cfg: DeployConfig) -> None:
         )
     if str(robot.get("imu_frame", "")).lower() not in ("torso", "pelvis"):
         raise ValueError("robot.imu_frame must be 'torso' or 'pelvis'")
+
+    if str(camera.get("name", "")) != "d455_camera":
+        raise ValueError("camera.name must be 'd455_camera'")
+    if str(camera.get("body", "")) != "d455_link":
+        raise ValueError("CarryBox camera.body must be 'd455_link'")
+    position = camera.get("position")
+    quaternion = camera.get("quaternion_wxyz")
+    if not isinstance(position, (list, tuple)) or len(position) != 3:
+        raise ValueError("camera.position must contain three values")
+    if not isinstance(quaternion, (list, tuple)) or len(quaternion) != 4:
+        raise ValueError("camera.quaternion_wxyz must contain four values")
+    if not all(math.isfinite(float(value)) for value in position):
+        raise ValueError("camera.position must be finite")
+    quaternion_norm = math.sqrt(
+        sum(float(value) ** 2 for value in quaternion)
+    )
+    if not math.isclose(quaternion_norm, 1.0, abs_tol=1e-6):
+        raise ValueError(
+            "camera.quaternion_wxyz must have unit norm, got "
+            f"{quaternion_norm:.9g}"
+        )
+    width = int(camera.get("width", 0))
+    height = int(camera.get("height", 0))
+    vertical_fov_deg = float(camera.get("vertical_fov_deg", 0.0))
+    near_m = float(camera.get("near_m", 0.0))
+    far_m = float(camera.get("far_m", 0.0))
+    if width <= 0 or height <= 0:
+        raise ValueError("camera width and height must be positive")
+    if not 0.0 < vertical_fov_deg < 180.0:
+        raise ValueError("camera.vertical_fov_deg must be in (0, 180)")
+    if near_m <= 0.0 or far_m <= near_m:
+        raise ValueError("camera range must satisfy 0 < near_m < far_m")
+    horizontal_fov_deg = math.degrees(
+        2.0
+        * math.atan(
+            (width / height)
+            * math.tan(math.radians(vertical_fov_deg) / 2.0)
+        )
+    )
+    if not 85.0 <= horizontal_fov_deg <= 90.0:
+        raise ValueError(
+            "camera resolution/fovy must reproduce the trained D455 "
+            f"85-90 degree horizontal FOV, got {horizontal_fov_deg:.3f}"
+        )
 
     profiles = policy.get("profiles")
     if isinstance(profiles, dict):

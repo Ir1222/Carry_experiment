@@ -137,7 +137,44 @@ def _check_scene(cfg: DeployConfig) -> str:
         raise RuntimeError(
             f"MuJoCo timestep={model.opt.timestep}, config physics_dt={physics_dt}"
         )
-    return f"nq={model.nq}, nv={model.nv}, nu={model.nu}, dt={model.opt.timestep:g}"
+    camera = cfg.section("camera")
+    camera_id = int(model.camera(str(camera["name"])).id)
+    expected_body_id = int(model.body(str(camera["body"])).id)
+    actual_body_id = int(model.cam_bodyid[camera_id])
+    if actual_body_id != expected_body_id:
+        raise RuntimeError(
+            f"camera belongs to {model.body(actual_body_id).name}, "
+            f"expected {camera['body']}"
+        )
+    expected_resolution = np.asarray(
+        (int(camera["width"]), int(camera["height"])),
+        dtype=np.int32,
+    )
+    if not np.array_equal(
+        model.cam_resolution[camera_id], expected_resolution
+    ):
+        raise RuntimeError(
+            "camera resolution does not match deployment config"
+        )
+    if not np.isclose(
+        float(model.cam_fovy[camera_id]),
+        float(camera["vertical_fov_deg"]),
+    ):
+        raise RuntimeError("camera vertical FOV does not match config")
+    if (
+        int(model.vis.global_.offwidth) < int(expected_resolution[0])
+        or int(model.vis.global_.offheight) < int(expected_resolution[1])
+    ):
+        raise RuntimeError(
+            "MuJoCo offscreen framebuffer is smaller than the "
+            "configured D455 resolution"
+        )
+    return (
+        f"nq={model.nq}, nv={model.nv}, nu={model.nu}, "
+        f"dt={model.opt.timestep:g}, "
+        f"camera={camera['name']}@{camera['body']} "
+        f"{expected_resolution[0]}x{expected_resolution[1]}"
+    )
 
 
 def _check_frequencies(cfg: DeployConfig) -> str:

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from deploy.common.camera import (
+    CameraIntrinsics,
+    project_box_to_camera,
+)
 from deploy.common.config import load_deploy_config
 from deploy.common.constants import (
     ACTION_DIM,
@@ -76,6 +82,40 @@ def test_config_and_urdf_mapping():
     assert robot.effort_limits[1] == 139.0
     assert robot.effort_limits[4] == 35.0
     assert robot.effort_limits[-1] == 5.0
+
+
+def test_d455_intrinsics_and_box_projection():
+    cfg = load_deploy_config(CONFIG_PATH)
+    intrinsics = CameraIntrinsics.from_config(cfg.section("camera"))
+    assert intrinsics.width == 848
+    assert intrinsics.height == 480
+    assert intrinsics.horizontal_fov_deg == pytest.approx(
+        88.20940168934209
+    )
+    visible = project_box_to_camera(
+        camera_position_world=np.zeros(3),
+        camera_rotation_to_world=np.eye(3),
+        box_position_world=np.array([0.0, 0.0, -2.0]),
+        box_rotation_to_world=np.eye(3),
+        box_half_size=np.array([0.15, 0.15, 0.125]),
+        intrinsics=intrinsics,
+    )
+    np.testing.assert_allclose(
+        visible["box_center_uv"], [424.0, 240.0]
+    )
+    assert visible["fully_visible"]
+    assert not visible["partially_visible"]
+    assert not visible["behind_camera"]
+    behind = project_box_to_camera(
+        camera_position_world=np.zeros(3),
+        camera_rotation_to_world=np.eye(3),
+        box_position_world=np.array([0.0, 0.0, 2.0]),
+        box_rotation_to_world=np.eye(3),
+        box_half_size=np.array([0.15, 0.15, 0.125]),
+        intrinsics=intrinsics,
+    )
+    assert behind["behind_camera"]
+    assert behind["box_center_uv"] is None
 
 
 def test_quaternion_convention_and_rotation_6d():
@@ -338,6 +378,56 @@ def test_mujoco_name_mapping_physics_profile_and_finite_ten_seconds():
     cfg = load_deploy_config(CONFIG_PATH)
     server = MujocoServer(cfg, transport="udp", viewer=False)
     try:
+        camera_cfg = cfg.section("camera")
+        assert server.model.ncam == 1
+        assert server.model.camera(camera_cfg["name"]).id == server.camera_id
+        assert (
+            int(server.model.cam_bodyid[server.camera_id])
+            == server.model.body(camera_cfg["body"]).id
+        )
+        assert server.model.nq == 43
+        assert server.model.nv == 41
+        assert server.model.nu == ACTION_DIM
+        assert server.model.vis.global_.offwidth >= 848
+        assert server.model.vis.global_.offheight >= 480
+        camera_rotation = server.data.cam_xmat[
+            server.camera_id
+        ].reshape(3, 3)
+        d455_rotation = server.data.xmat[
+            server.camera_body_id
+        ].reshape(3, 3)
+        np.testing.assert_allclose(
+            -camera_rotation[:, 2], d455_rotation[:, 2], atol=1e-6
+        )
+        np.testing.assert_allclose(
+            camera_rotation[:, 1], -d455_rotation[:, 1], atol=1e-6
+        )
+        default_camera_position = server.data.cam_xpos[
+            server.camera_id
+        ].copy()
+        projection = server.box_camera_projection()
+        assert projection["fully_visible"]
+        assert projection["center_depth_m"] > 0.0
+        assert np.isfinite(projection["box_center_uv"]).all()
+        assert server.camera_view == "free"
+        server._key_callback(67)
+        assert server.camera_view == "d455"
+        fake_viewer = SimpleNamespace(
+            cam=SimpleNamespace(type=None, fixedcamid=None),
+            lock=lambda: nullcontext(),
+        )
+        server._apply_viewer_camera(fake_viewer)
+        assert fake_viewer.cam.type == (
+            server.mujoco.mjtCamera.mjCAMERA_FIXED
+        )
+        assert fake_viewer.cam.fixedcamid == server.camera_id
+        server._key_callback(67)
+        assert server.camera_view == "free"
+        server._apply_viewer_camera(fake_viewer)
+        assert fake_viewer.cam.type == (
+            server.mujoco.mjtCamera.mjCAMERA_FREE
+        )
+        assert fake_viewer.cam.fixedcamid == -1
         collision = (server.model.geom_contype != 0) | (
             server.model.geom_conaffinity != 0
         )
@@ -362,6 +452,11 @@ def test_mujoco_name_mapping_physics_profile_and_finite_ten_seconds():
         waist_roll_qpos = server.name_map.joint_qpos_adr[13]
         server.data.qpos[waist_roll_qpos] = 0.35
         server.mujoco.mj_forward(server.model, server.data)
+        assert not np.allclose(
+            server.data.cam_xpos[server.camera_id],
+            default_camera_position,
+        )
+        server._validate_camera_axes()
         state = server.name_map.robot_state(
             server.model, server.data, sequence=1
         )

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import tempfile
+from typing import Any, Mapping
 import xml.etree.ElementTree as ET
 
 from deploy.common.config import load_deploy_config
@@ -66,7 +67,11 @@ def _enable_floating_base(root: ET.Element) -> None:
 
 
 def _add_actuators_and_imu(
-    mjcf_path: Path, robot: RobotDescription, *, joint_armature: float
+    mjcf_path: Path,
+    robot: RobotDescription,
+    *,
+    joint_armature: float,
+    camera_config: Mapping[str, Any],
 ) -> None:
     root = ET.parse(mjcf_path).getroot()
     compiler = root.find("compiler")
@@ -138,6 +143,54 @@ def _add_actuators_and_imu(
     ET.SubElement(
         sensor, "gyro", {"name": "torso_gyro", "site": "torso_imu_site"}
     )
+
+    camera_name = str(camera_config["name"])
+    camera_body_name = str(camera_config["body"])
+    camera_body = next(
+        (
+            body
+            for body in root.findall(".//body")
+            if body.attrib.get("name") == camera_body_name
+        ),
+        None,
+    )
+    if camera_body is None:
+        raise ValueError(
+            f"converted MJCF has no camera body {camera_body_name!r}"
+        )
+    existing_cameras = [
+        camera
+        for camera in root.findall(".//camera")
+        if camera.attrib.get("name") == camera_name
+    ]
+    if existing_cameras:
+        raise ValueError(
+            f"converted MJCF already contains camera {camera_name!r}"
+        )
+    position = " ".join(
+        f"{float(value):.9g}"
+        for value in camera_config["position"]
+    )
+    quaternion = " ".join(
+        f"{float(value):.9g}"
+        for value in camera_config["quaternion_wxyz"]
+    )
+    resolution = (
+        f"{int(camera_config['width'])} "
+        f"{int(camera_config['height'])}"
+    )
+    ET.SubElement(
+        camera_body,
+        "camera",
+        {
+            "name": camera_name,
+            "mode": "fixed",
+            "pos": position,
+            "quat": quaternion,
+            "fovy": f"{float(camera_config['vertical_fov_deg']):.9g}",
+            "resolution": resolution,
+        },
+    )
     ET.indent(root)
     ET.ElementTree(root).write(mjcf_path, encoding="unicode", xml_declaration=False)
 
@@ -147,11 +200,17 @@ def build_robot_mjcf(
     output_path: str | Path,
     *,
     joint_armature: float = 0.01,
+    camera_config: Mapping[str, Any] | None = None,
 ) -> Path:
     mujoco = _require_mujoco()
     urdf_path = Path(urdf_path).resolve()
     output_path = Path(output_path).resolve()
     robot = RobotDescription.from_urdf(urdf_path)
+    if camera_config is None:
+        raise ValueError(
+            "camera_config is required so the generated MJCF preserves "
+            "the trained D455 optical frame"
+        )
     urdf_root = ET.parse(urdf_path).getroot()
     mesh_dir = _normalise_mesh_paths(urdf_root, urdf_path)
     _enable_floating_base(urdf_root)
@@ -178,7 +237,10 @@ def build_robot_mjcf(
         mujoco.mj_saveLastXML(str(output_path), model)
 
     _add_actuators_and_imu(
-        output_path, robot, joint_armature=float(joint_armature)
+        output_path,
+        robot,
+        joint_armature=float(joint_armature),
+        camera_config=camera_config,
     )
 
     validation_model = mujoco.MjModel.from_xml_path(str(output_path))
@@ -191,6 +253,25 @@ def build_robot_mjcf(
     if validation_model.nu != len(JOINT_NAMES):
         raise RuntimeError(
             f"generated MJCF has {validation_model.nu} actuators, expected 29"
+        )
+    camera_name = str(camera_config["name"])
+    camera_body_name = str(camera_config["body"])
+    try:
+        camera_id = int(validation_model.camera(camera_name).id)
+        camera_body_id = int(
+            validation_model.body(camera_body_name).id
+        )
+    except KeyError as exc:
+        raise RuntimeError(
+            "generated MJCF is missing the configured D455 camera/body"
+        ) from exc
+    if int(validation_model.cam_bodyid[camera_id]) != camera_body_id:
+        actual_body = validation_model.body(
+            int(validation_model.cam_bodyid[camera_id])
+        ).name
+        raise RuntimeError(
+            f"camera {camera_name!r} belongs to {actual_body!r}, "
+            f"expected {camera_body_name!r}"
         )
     return output_path
 
@@ -212,6 +293,7 @@ def main() -> None:
         urdf,
         output,
         joint_armature=float(cfg.section("simulation").get("joint_armature", 0.01)),
+        camera_config=cfg.section("camera"),
     )
     print(f"Generated PhysHSI G1 MJCF: {result}")
 
