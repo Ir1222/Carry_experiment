@@ -209,6 +209,14 @@ limited joints, and 0.01 linear/angular free-base damping. Startup prints and
 logs the complete solver, contact, mass, inertia, friction and timestep
 fingerprint.
 
+The deterministic reset places the nominal 0.30 x 0.30 x 0.25 m box on a
+fixed 0.40 x 0.40 x 0.02 m source platform. The box-center height is 0.335 m,
+the median representative of Isaac Gym play's default `U(0, 0.65)` height
+sample followed by its 0.01 m lift. The configured 0.02 m geometric gap
+matches the two 0.01 m contact offsets/margins. This reproduces a typical
+play-default elevated pickup, not the full stochastic or motion-reference
+training reset.
+
 The deterministic reset is frozen until the first armed policy command. At
 each 50 Hz boundary the simulator publishes one state sequence and waits for
 the command computed from that exact sequence. Repeated UDP packets do not run
@@ -376,10 +384,10 @@ frame and the complete 738-D history.
 
 ## Known limits
 
-- The first scene uses the deterministic training-relative box reset
-  (`[1.75, 0, -0.665]` approximately in pelvis coordinates) and does not
-  reproduce AMP motion-state initialization, curriculum, or all PhysX
-  randomization.
+- The first scene uses a deterministic play-default representative with a
+  source platform (`[1.75, 0, -0.465]` box position approximately in pelvis
+  coordinates). It does not reproduce AMP motion-state initialization,
+  curriculum, the full box-height distribution, or all PhysX randomization.
 - PhysX and MuJoCo contact solvers differ; observation/action parity does not
   guarantee task-level cross-simulator success.
 - Approach/pickup/carry/putdown success rates still require the planned batch

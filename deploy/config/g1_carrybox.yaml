@@ -81,10 +81,21 @@ simulation:
   robot_initial_quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
   box_size: [0.30, 0.30, 0.25]
   box_density: 50.0
-  # Isaac Gym default play reset is robot x=2.3 with yaw=pi and box x=0.55,
-  # which is exactly +1.75 m in the pelvis/policy frame.
-  box_initial_position: [1.75, 0.0, 0.135]
+  # Deterministic representative of Isaac Gym play's default box reset:
+  # median raw z from U(0, 0.65) is 0.325 m, then _reset_boxes adds 0.01 m.
+  # Robot x=2.3/yaw=pi and box x=0.55 map to +1.75 m in the pelvis frame.
+  box_initial_position: [1.75, 0.0, 0.335]
   box_initial_quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+  source_platform:
+    enabled: true
+    size: [0.40, 0.40, 0.02]
+    # Isaac default reset leaves 0.02 m geometric separation: the box is
+    # lifted by 0.01 m and the platform center is one full height below its
+    # nominal support plane. Two 0.01 m contact margins close this gap.
+    box_gap: 0.02
+    # Isaac leaves platform friction at the PhysX default when random_props
+    # is false; sliding friction 1.0 is the closest MuJoCo approximation.
+    friction: [1.0, 0.02, 0.001]
   goal_position: [2.5, 0.75, 0.145]
   success_position_threshold: 0.10
   success_tilt_threshold: 0.20

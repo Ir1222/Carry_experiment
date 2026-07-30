@@ -43,6 +43,7 @@ from deploy.policy.core import PolicyCore
 from deploy.policy.backends import SequenceStatePair
 from deploy.policy.inference import OnnxActor
 from deploy.policy.run import classify_sequence
+from deploy.sim2sim.mujoco_server import source_platform_center
 from deploy.tools.export_actor import load_actor_from_checkpoint
 
 
@@ -83,6 +84,29 @@ def test_config_and_urdf_mapping():
     assert robot.effort_limits[1] == 139.0
     assert robot.effort_limits[4] == 35.0
     assert robot.effort_limits[-1] == 5.0
+
+
+def test_source_platform_matches_isaac_default_reset_geometry():
+    cfg = load_deploy_config(CONFIG_PATH)
+    simulation = cfg.section("simulation")
+    platform = simulation["source_platform"]
+    box_position = np.asarray(
+        simulation["box_initial_position"], dtype=np.float64
+    )
+    box_size = np.asarray(simulation["box_size"], dtype=np.float64)
+    platform_size = np.asarray(platform["size"], dtype=np.float64)
+    center = source_platform_center(
+        box_position,
+        box_size,
+        platform_size,
+        float(platform["box_gap"]),
+    )
+
+    np.testing.assert_allclose(center, [1.75, 0.0, 0.18])
+    box_bottom = box_position[2] - 0.5 * box_size[2]
+    platform_top = center[2] + 0.5 * platform_size[2]
+    assert box_bottom - platform_top == pytest.approx(0.02)
+    assert platform["enabled"] is True
 
 
 def test_d455_intrinsics_and_box_projection():

@@ -153,6 +153,44 @@ def _validate(cfg: DeployConfig) -> None:
     if str(robot.get("imu_frame", "")).lower() not in ("torso", "pelvis"):
         raise ValueError("robot.imu_frame must be 'torso' or 'pelvis'")
 
+    source_platform = simulation.get("source_platform")
+    if not isinstance(source_platform, dict):
+        raise ValueError("simulation.source_platform must be a mapping")
+    if not isinstance(source_platform.get("enabled"), bool):
+        raise ValueError("simulation.source_platform.enabled must be boolean")
+    platform_size = source_platform.get("size")
+    if (
+        not isinstance(platform_size, (list, tuple))
+        or len(platform_size) != 3
+        or not all(
+            math.isfinite(float(value)) and float(value) > 0.0
+            for value in platform_size
+        )
+    ):
+        raise ValueError(
+            "simulation.source_platform.size must contain three positive "
+            "finite values"
+        )
+    platform_gap = float(source_platform.get("box_gap", -1.0))
+    if not math.isfinite(platform_gap) or platform_gap < 0.0:
+        raise ValueError(
+            "simulation.source_platform.box_gap must be finite and "
+            "non-negative"
+        )
+    platform_friction = source_platform.get("friction")
+    if (
+        not isinstance(platform_friction, (list, tuple))
+        or len(platform_friction) != 3
+        or not all(
+            math.isfinite(float(value)) and float(value) >= 0.0
+            for value in platform_friction
+        )
+    ):
+        raise ValueError(
+            "simulation.source_platform.friction must contain three "
+            "non-negative finite values"
+        )
+
     if str(camera.get("name", "")) != "d455_camera":
         raise ValueError("camera.name must be 'd455_camera'")
     if str(camera.get("body", "")) != "d455_link":

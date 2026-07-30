@@ -30,7 +30,12 @@
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="ground_material"/>
 
-    <body name="carry_box" pos="1 0 0.135">
+    <body name="source_platform" pos="1.75 0 0.18">
+      <geom name="source_platform_geom" type="box" size="0.2 0.2 0.01"
+            friction="1 0.02 0.001" rgba="0.50 0.235 0.60 1"/>
+    </body>
+
+    <body name="carry_box" pos="1.75 0 0.335">
       <freejoint name="box_free_joint"/>
       <geom name="carry_box_geom" type="box" size="0.15 0.15 0.125"
             density="50" rgba="0.72 0.42 0.12 1"/>

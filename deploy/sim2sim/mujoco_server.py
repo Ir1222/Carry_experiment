@@ -43,6 +43,30 @@ def _require_mujoco():
     return mujoco
 
 
+def source_platform_center(
+    box_position: np.ndarray,
+    box_size: np.ndarray,
+    platform_size: np.ndarray,
+    box_gap: float,
+) -> np.ndarray:
+    """Place the fixed platform below a box using the Isaac default-reset gap."""
+
+    box_position = np.asarray(box_position, dtype=np.float64)
+    box_size = np.asarray(box_size, dtype=np.float64)
+    platform_size = np.asarray(platform_size, dtype=np.float64)
+    if box_position.shape != (3,):
+        raise ValueError("box_position must have shape (3,)")
+    if box_size.shape != (3,) or np.any(box_size <= 0.0):
+        raise ValueError("box_size must contain three positive values")
+    if platform_size.shape != (3,) or np.any(platform_size <= 0.0):
+        raise ValueError("platform_size must contain three positive values")
+    if not np.isfinite(box_gap) or box_gap < 0.0:
+        raise ValueError("box_gap must be finite and non-negative")
+    center = box_position.copy()
+    center[2] -= 0.5 * box_size[2] + float(box_gap) + 0.5 * platform_size[2]
+    return center
+
+
 class MujocoServer:
     def __init__(
         self,
@@ -147,11 +171,20 @@ class MujocoServer:
 
     def _configure_scene(self) -> None:
         self.box_size = np.asarray(self.sim_cfg["box_size"], dtype=np.float64)
+        self.box_initial_position = np.asarray(
+            self.sim_cfg["box_initial_position"], dtype=np.float64
+        )
         self.goal_position = np.asarray(
             self.sim_cfg["goal_position"], dtype=np.float64
         )
         self.box_body_id = int(self.model.body("carry_box").id)
         self.box_geom_id = int(self.model.geom("carry_box_geom").id)
+        self.source_platform_body_id = int(
+            self.model.body("source_platform").id
+        )
+        self.source_platform_geom_id = int(
+            self.model.geom("source_platform_geom").id
+        )
         self.goal_site_id = int(self.model.site("goal_site").id)
         self.head_body_id = int(self.model.body("mid360_link").id)
         self.hip_yaw_body_ids = np.asarray(
@@ -171,6 +204,46 @@ class MujocoServer:
             / 12.0
             * np.asarray((y * y + z * z, x * x + z * z, x * x + y * y))
         )
+        source_platform_cfg = self.sim_cfg["source_platform"]
+        self.source_platform_enabled = bool(source_platform_cfg["enabled"])
+        self.source_platform_size = np.asarray(
+            source_platform_cfg["size"], dtype=np.float64
+        )
+        self.source_platform_box_gap = float(
+            source_platform_cfg["box_gap"]
+        )
+        self.source_platform_friction = np.asarray(
+            source_platform_cfg["friction"], dtype=np.float64
+        )
+        self.source_platform_position = source_platform_center(
+            self.box_initial_position,
+            self.box_size,
+            self.source_platform_size,
+            self.source_platform_box_gap,
+        )
+        self.model.geom_size[
+            self.source_platform_geom_id, :3
+        ] = self.source_platform_size / 2.0
+        self.model.geom_friction[
+            self.source_platform_geom_id, :3
+        ] = self.source_platform_friction
+        if self.source_platform_enabled:
+            self.model.body_pos[
+                self.source_platform_body_id
+            ] = self.source_platform_position
+            self.model.geom_contype[self.source_platform_geom_id] = 1
+            self.model.geom_conaffinity[self.source_platform_geom_id] = 1
+        else:
+            self.model.body_pos[self.source_platform_body_id] = np.asarray(
+                (
+                    self.source_platform_position[0],
+                    self.source_platform_position[1],
+                    -5.0,
+                ),
+                dtype=np.float64,
+            )
+            self.model.geom_contype[self.source_platform_geom_id] = 0
+            self.model.geom_conaffinity[self.source_platform_geom_id] = 0
         self.model.site_pos[self.goal_site_id] = self.goal_position
 
     def _configure_camera(self) -> None:
@@ -313,6 +386,13 @@ class MujocoServer:
             "box_inertia": self.model.body_inertia[
                 self.box_body_id
             ].tolist(),
+            "source_platform": {
+                "enabled": self.source_platform_enabled,
+                "size": self.source_platform_size.tolist(),
+                "position": self.source_platform_position.tolist(),
+                "box_gap": self.source_platform_box_gap,
+                "friction": self.source_platform_friction.tolist(),
+            },
         }
 
     def _free_joint_address(self, name: str) -> int:
@@ -329,9 +409,7 @@ class MujocoServer:
         )
         self.data.qpos[self.name_map.joint_qpos_adr] = np.asarray(DEFAULT_DOF_POS)
         box_adr = self._free_joint_address("box_free_joint")
-        self.data.qpos[box_adr : box_adr + 3] = np.asarray(
-            self.sim_cfg["box_initial_position"], dtype=np.float64
-        )
+        self.data.qpos[box_adr : box_adr + 3] = self.box_initial_position
         self.data.qpos[box_adr + 3 : box_adr + 7] = np.asarray(
             self.sim_cfg["box_initial_quaternion_wxyz"], dtype=np.float64
         )
