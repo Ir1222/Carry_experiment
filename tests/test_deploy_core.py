@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from pathlib import Path
 import time
 from types import SimpleNamespace
 
@@ -301,6 +302,25 @@ def test_default_checkpoint_actor_contract():
         output = actor(torch.zeros(2, ACTOR_OBS_DIM))
     assert tuple(output.shape) == (2, ACTION_DIM)
     assert torch.isfinite(output).all()
+
+
+def test_training_checkpoint_profiles_are_independent():
+    cfg = load_deploy_config(CONFIG_PATH)
+
+    assert cfg.checkpoint_path_for("model_55500") == (
+        Path.cwd()
+        / "legged_gym/logs/Jul06_from_41000/model_55500.pt"
+    ).resolve()
+    assert cfg.onnx_path_for("model_55500").name == "carrybox_55500.onnx"
+    assert (
+        cfg.manifest_path_for("model_55500").name
+        == "carrybox_55500.manifest.json"
+    )
+    assert cfg.onnx_path_for("model_55500") != cfg.onnx_path_for("model_73500")
+    assert (
+        cfg.manifest_path_for("model_55500")
+        != cfg.manifest_path_for("model_73500")
+    )
 
 
 def test_exported_onnx_matches_checkpoint():

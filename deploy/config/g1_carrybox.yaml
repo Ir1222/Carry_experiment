@@ -7,6 +7,10 @@ policy:
       checkpoint: legged_gym/resources/ckpt/carrybox.pt
       onnx_path: deploy/models/official_carrybox_65000.onnx
       manifest_path: deploy/models/official_carrybox_65000.manifest.json
+    model_55500:
+      checkpoint: legged_gym/logs/Jul06_from_41000/model_55500.pt
+      onnx_path: deploy/models/carrybox_55500.onnx
+      manifest_path: deploy/models/carrybox_55500.manifest.json
     model_73500:
       checkpoint: legged_gym/logs/Jul09_from_55500/model_73500.pt
       onnx_path: deploy/models/carrybox_73500.onnx

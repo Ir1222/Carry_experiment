@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "config": "D:\\AAAProject\\base_experi\\PhysHSI\\deploy\\config\\g1_carrybox.yaml",
+  "duration_seconds": 20.0,
+  "warmup_seconds": 0.5,
+  "all_passed": false,
+  "models": [
+    {
+      "model_profile": "model_55500",
+      "policy_steps": 796,
+      "safe_steps": 772,
+      "safe_fraction": 1.0,
+      "policy_hz": 39.5709299938411,
+      "physics_steps": 3996,
+      "physics_hz": 199.84981226532858,
+      "physics_wall_hz": 199.7498123592694,
+      "max_inference_ms": 0.6936,
+      "inference_p99_ms": 0.4286799999999999,
+      "max_projected_gravity_xy": 0.6199766344748179,
+      "max_joint_limit_violation_rad": 0.005196261294138416,
+      "forbidden_ground_contact_steps": 0,
+      "sequence_reset_count": 0,
+      "mid_interval_action_change_count": 0,
+      "non_decimated_policy_step_count": 254,
+      "first_failure_sequence": 2280,
+      "first_failure_time": 11.415000000000385,
+      "first_failure_reason": "training roll termination: roll=-0.513809",
+      "passed": false,
+      "failures": [
+        "policy frequency is 39.57 Hz, expected 50 Hz +/-5%",
+        "MuJoCo episode reached a training termination at sim_time=11.415s sequence=2280: training roll termination: roll=-0.513809",
+        "policy did not consume exactly every fourth physics state: 2280 -> 2290"
+      ]
+    }
+  ]
+}
