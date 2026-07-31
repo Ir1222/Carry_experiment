@@ -115,6 +115,28 @@ def test_smoke_log_verifier_checks_rates_safety_and_finiteness(tmp_path):
     with pytest.raises(RuntimeError, match="not continuously safe"):
         verify_logs(policy_log, simulator_log)
 
+    policy_log.write_text(
+        "".join(json.dumps(record) + "\n" for record in policy_records),
+        encoding="utf-8",
+    )
+    simulator_records[0]["contacts"] = [
+        {
+            "body1": "left_rubber_hand",
+            "body2": "left_hip_yaw_link",
+            "force_contact_frame": [2.0, 0.0, 0.0],
+        }
+    ]
+    simulator_log.write_text(
+        "".join(json.dumps(record) + "\n" for record in simulator_records),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="initial MuJoCo state"):
+        verify_logs(
+            policy_log,
+            simulator_log,
+            require_contact_parity=True,
+        )
+
 
 def test_observation_snapshot_comparator_uses_policy_frame(tmp_path):
     endpoints = np.arange(15, dtype=np.float64).reshape(5, 3)

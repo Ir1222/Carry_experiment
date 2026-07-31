@@ -66,6 +66,37 @@ simulation:
   physics_dt: 0.005
   joint_armature: 0.01
   contact_margin: 0.01
+  collision:
+    default_profile: current
+    profiles:
+      # Reproduces the pre-diagnostic behavior: every collidable geom receives
+      # the same margin and MuJoCo decides all robot self-contact pairs.
+      current:
+        disable_robot_self: false
+        robot_margin: 0.01
+        external_margin: 0.01
+        exclude_body_pairs: []
+      # Diagnostic ablation B. Robot-box, feet-ground and box-platform contacts
+      # remain active while every robot-robot pair is filtered.
+      no_robot_self:
+        disable_robot_self: true
+        robot_margin: 0.01
+        external_margin: 0.01
+        exclude_body_pairs: []
+      # Diagnostic ablation C. The exclusions are the persistent pairs found in
+      # the old MuJoCo trace; an Isaac trace must confirm them before this profile
+      # is promoted to the production default.
+      isaac_parity:
+        disable_robot_self: false
+        robot_margin: 0.0
+        external_margin: 0.01
+        exclude_body_pairs:
+          - [left_rubber_hand, left_hip_roll_link]
+          - [left_rubber_hand, left_hip_yaw_link]
+          - [right_rubber_hand, right_hip_roll_link]
+          - [right_rubber_hand, right_hip_yaw_link]
+          - [left_elbow_link, left_wrist_pitch_link]
+          - [right_elbow_link, right_wrist_pitch_link]
   joint_limit_solref: [0.01, 1.0]
   joint_limit_solimp: [0.99, 0.999, 0.001, 0.5, 2.0]
   disable_refsafe_for_joint_limits: false
@@ -104,6 +135,59 @@ simulation:
   termination_hip_yaw_height: 0.15
   termination_roll_abs: 0.50
   termination_pitch_abs: 1.10
+
+sim2sim_randomization:
+  default_profile: nominal
+  nominal_robot_friction: 0.8
+  profiles:
+    nominal:
+      scale: 0.0
+      max_action_delay_steps: 0
+      disturbance: false
+    light:
+      scale: 0.25
+      max_action_delay_steps: 1
+      disturbance: true
+    train_match:
+      scale: 1.0
+      max_action_delay_steps: 4
+      disturbance: true
+  # Values below mirror the CarryBox training envelope where MuJoCo has a
+  # meaningful counterpart. Contact restitution is deliberately not exposed
+  # as a coefficient because MuJoCo has no PhysX-equivalent scalar.
+  train_match_ranges:
+    joint_position_offset: [-0.1, 0.1]
+    root_linear_velocity: [-0.5, 0.5]
+    root_angular_velocity: [-0.5, 0.5]
+    box_scale_x: [0.7, 1.3]
+    box_scale_y: [0.7, 1.3]
+    box_scale_z: [0.6, 1.4]
+    box_density: [10.0, 100.0]
+    box_xy_abs: [0.7, 4.0]
+    box_z: [0.0, 0.65]
+    goal_distance: [0.6, 4.0]
+    goal_bearing_abs_deg: [10.0, 80.0]
+    goal_z: [0.0, 0.4]
+    robot_friction: [0.1, 1.5]
+    link_mass_scale: [0.8, 1.2]
+    torso_payload_mass: [-2.0, 5.0]
+    torso_com_displacement: [-0.1, 0.1]
+    kp_factor: [0.9, 1.1]
+    kd_factor: [0.9, 1.1]
+    motor_strength: [0.9, 1.1]
+    torque_bias_fraction: [-0.05, 0.05]
+    observation_noise:
+      gyro: 0.3
+      # MuJoCo observations expose orientation, not projected gravity as a
+      # separate sensor; this is an equivalent small rotation in radians.
+      gravity_rotation: 0.05
+      joint_position: 0.02
+      joint_velocity: 2.0
+      endpoint: 0.05
+      task_position: 0.05
+      task_orientation_deg: 5.0
+    disturbance_interval_policy_steps: 8
+    disturbance_force: 50.0
 
 network:
   domain_id: 0

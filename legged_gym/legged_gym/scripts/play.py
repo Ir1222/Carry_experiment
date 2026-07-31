@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
@@ -14,6 +15,116 @@ from legged_gym.scripts.boxperturb_reporting import (
     summarize_force_trace,
     write_run_files,
 )
+
+
+def _disable_carrybox_deploy_randomization(env_cfg):
+    """Create a one-environment trace whose state is reproducible and inspectable."""
+    env_cfg.env.num_envs = 1
+    env_cfg.noise.add_noise = False
+    env_cfg.asset.box.random_size = False
+    env_cfg.asset.box.random_density = False
+    env_cfg.asset.box.random_props = False
+    for name in (
+        "randomize_actuation_offset",
+        "randomize_motor_strength",
+        "randomize_payload_mass",
+        "randomize_com_displacement",
+        "randomize_link_mass",
+        "randomize_friction",
+        "randomize_restitution",
+        "randomize_kp",
+        "randomize_kd",
+        "randomize_initial_joint_pos",
+        "disturbance",
+        "delay",
+        "push_robots",
+    ):
+        if hasattr(env_cfg.domain_rand, name):
+            setattr(env_cfg.domain_rand, name, False)
+
+
+def _jsonable(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _contact_field(contact, name, default=None):
+    if isinstance(contact, dict):
+        return contact.get(name, default)
+    try:
+        return contact[name]
+    except (KeyError, TypeError, IndexError):
+        return getattr(contact, name, default)
+
+
+def _isaac_contact_records(env):
+    """Best-effort extraction of PhysX rigid-contact pairs and impulse-derived force."""
+    try:
+        raw_contacts = env.gym.get_env_rigid_contacts(env.envs[0])
+    except (AttributeError, RuntimeError):
+        return []
+    body_names = ["source_platform", "target_platform", "carry_box"]
+    body_names.extend(str(name) for name in getattr(env, "body_names", ()))
+    dt = float(getattr(env, "dt", 0.02))
+    records = []
+    for contact in raw_contacts:
+        body0 = int(_contact_field(contact, "body0", -1))
+        body1 = int(_contact_field(contact, "body1", -1))
+        impulse = float(_contact_field(contact, "lambda", 0.0))
+        records.append(
+            {
+                "body1": body_names[body0] if 0 <= body0 < len(body_names) else f"body_{body0}",
+                "body2": body_names[body1] if 0 <= body1 < len(body_names) else f"body_{body1}",
+                "normal_world": _jsonable(_contact_field(contact, "normal", [0.0, 0.0, 0.0])),
+                "normal_impulse": impulse,
+                "force_norm": abs(impulse) / dt if dt > 0.0 else 0.0,
+            }
+        )
+    return records
+
+
+def _actor_command_diagnostics(env, action_row):
+    q_target = (
+        env.default_dof_pos[0]
+        + action_row * float(env.cfg.control.action_scale)
+    )
+    pd_torque = (
+        env.p_gains
+        * env.Kp_factors[0]
+        * (q_target - env.dof_pos[0])
+        - env.d_gains * env.Kd_factors[0] * env.dof_vel[0]
+    )
+    commanded_torque = torch.clip(
+        pd_torque * env.motor_strength[0] + env.actuation_offset[0],
+        -env.torque_limits,
+        env.torque_limits,
+    )
+    return q_target, commanded_torque
+
+
+def _write_carrybox_trace_record(stream, env, *, step_index, action, phase):
+    snapshot = dict(getattr(env, "_deploy_snapshot", {}))
+    action_row = action[0]
+    q_target, commanded_torque = _actor_command_diagnostics(env, action_row)
+    snapshot["kind"] = "isaac_carrybox_step"
+    snapshot["step_index"] = int(step_index)
+    snapshot["sim_time"] = float(step_index * env.dt)
+    snapshot["phase"] = phase
+    snapshot["policy_action"] = action_row
+    snapshot["q_target"] = q_target
+    snapshot["torque"] = commanded_torque
+    snapshot["contacts"] = _isaac_contact_records(env)
+    stream.write(json.dumps(_jsonable(snapshot), separators=(",", ":")) + "\n")
+    stream.flush()
 
 
 def _parse_csv_floats(value, default):
@@ -411,6 +522,11 @@ def run_boxperturb_visual_sweep(env, policy, args):
     print(f"[SweepComplete] trials={len(trials)} trace_rows={len(traces)} output_dir={os.path.abspath(output_dir)}")
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    if args.deploy_snapshot and args.deploy_trace:
+        raise ValueError("--deploy_snapshot and --deploy_trace are mutually exclusive")
+    if args.deploy_trace and args.deploy_trace_steps < 1:
+        raise ValueError("--deploy_trace_steps must be positive")
+    carrybox_deploy_diagnostic = bool(args.deploy_snapshot or args.deploy_trace)
     # override some parameters for testing
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 10)
     env_cfg.env.test = True
@@ -428,11 +544,10 @@ def play(args):
         # Play only needs the actor. Load it separately so old 126-D critic
         # checkpoints can run with the current 143-D carry-phase environment.
         train_cfg.runner.resume = False
-        if args.deploy_snapshot:
+        if carrybox_deploy_diagnostic:
             if args.deploy_snapshot_count < 1:
                 raise ValueError("--deploy_snapshot_count must be positive")
-            env_cfg.env.num_envs = 1
-            env_cfg.noise.add_noise = False
+            _disable_carrybox_deploy_randomization(env_cfg)
             if args.deploy_snapshot_phase:
                 phase_names = ("loco", "pickUp", "carryWith", "putDown")
                 phase_index = phase_names.index(args.deploy_snapshot_phase)
@@ -484,11 +599,29 @@ def play(args):
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
-    if args.deploy_snapshot:
+    if carrybox_deploy_diagnostic:
         if args.task != 'carrybox':
-            raise ValueError("--deploy_snapshot is supported only for --task carrybox")
+            raise ValueError("CarryBox deploy diagnostics require --task carrybox")
         env._capture_deploy_snapshot = True
     deploy_snapshot_index = 0
+    deploy_trace_stream = None
+    if args.deploy_trace:
+        deploy_trace_path = os.path.abspath(os.path.expanduser(args.deploy_trace))
+        deploy_trace_parent = os.path.dirname(deploy_trace_path)
+        if deploy_trace_parent:
+            os.makedirs(deploy_trace_parent, exist_ok=True)
+        deploy_trace_stream = open(deploy_trace_path, "w", encoding="utf-8")
+        metadata = {
+            "kind": "run_metadata",
+            "component": "isaac_carrybox",
+            "format_version": 1,
+            "phase": args.deploy_snapshot_phase or "default",
+            "deterministic": True,
+            "observation_noise": False,
+            "domain_randomization": False,
+        }
+        deploy_trace_stream.write(json.dumps(metadata, separators=(",", ":")) + "\n")
+        deploy_trace_stream.flush()
     obs = env.get_observations()
 
     # load policy
@@ -523,54 +656,83 @@ def play(args):
         env.commands[:, 2] = 0.0
         env.gym.fetch_results(env.sim, True)
         actions = policy(obs.detach())
+        if args.deploy_snapshot and hasattr(env, "_deploy_snapshot"):
+            requested_path = os.path.abspath(
+                os.path.expanduser(args.deploy_snapshot)
+            )
+            if args.deploy_snapshot_count == 1:
+                snapshot_path = requested_path
+            else:
+                requested_root, requested_ext = os.path.splitext(
+                    requested_path
+                )
+                phase = args.deploy_snapshot_phase or "default"
+                if requested_ext.lower() == ".npz":
+                    snapshot_path = (
+                        f"{requested_root}_{phase}_"
+                        f"{deploy_snapshot_index:03d}.npz"
+                    )
+                else:
+                    snapshot_path = os.path.join(
+                        requested_path,
+                        f"{phase}_{deploy_snapshot_index:03d}.npz",
+                    )
+            parent = os.path.dirname(snapshot_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            snapshot = dict(env._deploy_snapshot)
+            action_row = actions[0]
+            q_target, commanded_torque = _actor_command_diagnostics(
+                env, action_row
+            )
+            snapshot["policy_action"] = (
+                action_row.detach().cpu().numpy().copy()
+            )
+            snapshot["q_target"] = (
+                q_target.detach().cpu().numpy().copy()
+            )
+            snapshot["torque"] = (
+                commanded_torque.detach().cpu().numpy().copy()
+            )
+            snapshot["snapshot_phase"] = np.asarray(
+                args.deploy_snapshot_phase or "default"
+            )
+            snapshot["snapshot_index"] = np.asarray(
+                deploy_snapshot_index, dtype=np.int64
+            )
+            np.savez(snapshot_path, **snapshot)
+            print(f"Wrote CarryBox deployment snapshot: {snapshot_path}")
+            deploy_snapshot_index += 1
+            if deploy_snapshot_index >= args.deploy_snapshot_count:
+                return
+            obs, _ = env.reset()
+            env._capture_deploy_snapshot = True
+            continue
+
+        if deploy_trace_stream is not None:
+            _write_carrybox_trace_record(
+                deploy_trace_stream,
+                env,
+                step_index=i,
+                action=actions,
+                phase=args.deploy_snapshot_phase or "default",
+            )
         if args.play_dataset:
             env.play_dataset_step(i)
         else:
             obs, _, rews, dones, infos, _, _, amp_state = env.step(actions.detach())
 
-            if args.deploy_snapshot and hasattr(env, "_deploy_snapshot"):
-                requested_path = os.path.abspath(
-                    os.path.expanduser(args.deploy_snapshot)
-                )
-                if args.deploy_snapshot_count == 1:
-                    snapshot_path = requested_path
-                else:
-                    requested_root, requested_ext = os.path.splitext(
-                        requested_path
-                    )
-                    phase = args.deploy_snapshot_phase or "default"
-                    if requested_ext.lower() == ".npz":
-                        snapshot_path = (
-                            f"{requested_root}_{phase}_"
-                            f"{deploy_snapshot_index:03d}.npz"
-                        )
-                    else:
-                        snapshot_path = os.path.join(
-                            requested_path,
-                            f"{phase}_{deploy_snapshot_index:03d}.npz",
-                        )
-                parent = os.path.dirname(snapshot_path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                snapshot = dict(env._deploy_snapshot)
-                snapshot["snapshot_phase"] = np.asarray(
-                    args.deploy_snapshot_phase or "default"
-                )
-                snapshot["snapshot_index"] = np.asarray(
-                    deploy_snapshot_index, dtype=np.int64
-                )
-                np.savez(snapshot_path, **snapshot)
-                print(f"Wrote CarryBox deployment snapshot: {snapshot_path}")
-                deploy_snapshot_index += 1
-                if deploy_snapshot_index >= args.deploy_snapshot_count:
+            if deploy_trace_stream is not None:
+                if i + 1 >= args.deploy_trace_steps:
+                    deploy_trace_stream.close()
+                    print(f"Wrote deterministic CarryBox trace: {deploy_trace_path}")
                     return
-                obs, _ = env.reset()
-                env._capture_deploy_snapshot = True
-                continue
 
             # Carry phase detection: print the detector result while replaying carrybox.pt.
             if args.task == 'carrybox' and CARRY_PHASE_DEBUG and i % CARRY_PHASE_DEBUG_INTERVAL == 0:
                 print_carry_phase_debug(env, dones, i, env_id=CARRY_PHASE_DEBUG_ENV_ID)
+    if deploy_trace_stream is not None:
+        deploy_trace_stream.close()
 
 if __name__ == '__main__':
     EXPORT_POLICY = False

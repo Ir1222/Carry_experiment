@@ -109,6 +109,7 @@ def _validate(cfg: DeployConfig) -> None:
     simulation = cfg.section("simulation")
     robot = cfg.section("robot")
     camera = cfg.section("camera")
+    randomization = cfg.section("sim2sim_randomization")
 
     expected = {
         "actor_obs_dim": ACTOR_OBS_DIM,
@@ -262,6 +263,59 @@ def _validate(cfg: DeployConfig) -> None:
     contact_margin = float(simulation.get("contact_margin", 0.0))
     if contact_margin < 0.0:
         raise ValueError("simulation.contact_margin must be non-negative")
+    collision = simulation.get("collision")
+    if not isinstance(collision, dict):
+        raise ValueError("simulation.collision must be a mapping")
+    collision_profiles = collision.get("profiles")
+    expected_collision_profiles = {
+        "current",
+        "no_robot_self",
+        "isaac_parity",
+    }
+    if (
+        not isinstance(collision_profiles, dict)
+        or set(collision_profiles) != expected_collision_profiles
+    ):
+        raise ValueError(
+            "simulation.collision.profiles must define current, "
+            "no_robot_self, and isaac_parity"
+        )
+    default_collision_profile = str(
+        collision.get("default_profile", "current")
+    )
+    if default_collision_profile not in collision_profiles:
+        raise ValueError(
+            "simulation.collision.default_profile must name a profile"
+        )
+    for name, collision_profile in collision_profiles.items():
+        if not isinstance(collision_profile, dict):
+            raise ValueError(
+                f"simulation.collision.profiles.{name} must be a mapping"
+            )
+        if not isinstance(
+            collision_profile.get("disable_robot_self"), bool
+        ):
+            raise ValueError(
+                f"collision profile {name} disable_robot_self must be boolean"
+            )
+        for margin_name in ("robot_margin", "external_margin"):
+            margin = float(collision_profile.get(margin_name, -1.0))
+            if not math.isfinite(margin) or margin < 0.0:
+                raise ValueError(
+                    f"collision profile {name} {margin_name} must be "
+                    "finite and non-negative"
+                )
+        exclusions = collision_profile.get("exclude_body_pairs")
+        if not isinstance(exclusions, list) or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(body, str) and body for body in pair)
+            for pair in exclusions
+        ):
+            raise ValueError(
+                f"collision profile {name} exclude_body_pairs must be a "
+                "list of two-body-name lists"
+            )
     solref = simulation.get("joint_limit_solref", (0.005, 1.0))
     if (
         not isinstance(solref, (list, tuple))
@@ -294,4 +348,111 @@ def _validate(cfg: DeployConfig) -> None:
     if not isinstance(solimp, (list, tuple)) or len(solimp) != 5:
         raise ValueError(
             "simulation.joint_limit_solimp must contain five values"
+        )
+
+    profiles = randomization.get("profiles")
+    if not isinstance(profiles, dict) or set(profiles) != {
+        "nominal",
+        "light",
+        "train_match",
+    }:
+        raise ValueError(
+            "sim2sim_randomization.profiles must define nominal, light, "
+            "and train_match"
+        )
+    default_randomization = str(
+        randomization.get("default_profile", "nominal")
+    )
+    if default_randomization not in profiles:
+        raise ValueError(
+            "sim2sim_randomization.default_profile must name a profile"
+        )
+    for name, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValueError(
+                f"sim2sim_randomization.profiles.{name} must be a mapping"
+            )
+        scale = float(profile.get("scale", -1.0))
+        max_delay = int(profile.get("max_action_delay_steps", -1))
+        if not 0.0 <= scale <= 1.0:
+            raise ValueError(
+                f"randomization profile {name} scale must be in [0, 1]"
+            )
+        if not 0 <= max_delay <= 4:
+            raise ValueError(
+                f"randomization profile {name} delay must be in [0, 4]"
+            )
+    ranges = randomization.get("train_match_ranges")
+    if not isinstance(ranges, dict):
+        raise ValueError(
+            "sim2sim_randomization.train_match_ranges must be a mapping"
+        )
+    required_ranges = (
+        "joint_position_offset",
+        "root_linear_velocity",
+        "root_angular_velocity",
+        "box_scale_x",
+        "box_scale_y",
+        "box_scale_z",
+        "box_density",
+        "box_xy_abs",
+        "box_z",
+        "goal_distance",
+        "goal_bearing_abs_deg",
+        "goal_z",
+        "robot_friction",
+        "link_mass_scale",
+        "torso_payload_mass",
+        "torso_com_displacement",
+        "kp_factor",
+        "kd_factor",
+        "motor_strength",
+        "torque_bias_fraction",
+    )
+    for key in required_ranges:
+        value = ranges.get(key)
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) != 2
+            or not all(math.isfinite(float(item)) for item in value)
+            or float(value[0]) > float(value[1])
+        ):
+            raise ValueError(
+                f"sim2sim_randomization.train_match_ranges.{key} "
+                "must be a finite [low, high] range"
+            )
+    if float(ranges["box_density"][0]) <= 0.0:
+        raise ValueError("randomized box density must remain positive")
+    if float(ranges["robot_friction"][0]) <= 0.0:
+        raise ValueError("randomized friction must remain positive")
+    if float(ranges["link_mass_scale"][0]) <= 0.0:
+        raise ValueError("randomized link mass scale must remain positive")
+    for key in ("kp_factor", "kd_factor", "motor_strength"):
+        if float(ranges[key][0]) <= 0.0:
+            raise ValueError(f"randomized {key} must remain positive")
+    noise = ranges.get("observation_noise")
+    required_noise = (
+        "gyro",
+        "gravity_rotation",
+        "joint_position",
+        "joint_velocity",
+        "endpoint",
+        "task_position",
+        "task_orientation_deg",
+    )
+    if not isinstance(noise, dict) or any(
+        key not in noise
+        or not math.isfinite(float(noise[key]))
+        or float(noise[key]) < 0.0
+        for key in required_noise
+    ):
+        raise ValueError(
+            "sim2sim randomization observation noise values must be "
+            "finite and non-negative"
+        )
+    interval = int(ranges.get("disturbance_interval_policy_steps", 0))
+    force = float(ranges.get("disturbance_force", -1.0))
+    if interval <= 0 or not math.isfinite(force) or force < 0.0:
+        raise ValueError(
+            "disturbance interval must be positive and force non-negative"
         )

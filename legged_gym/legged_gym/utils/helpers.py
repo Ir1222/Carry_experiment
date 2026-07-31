@@ -207,6 +207,8 @@ def get_args():
         {"name": "--deploy_snapshot", "type": str, "default": None, "help": "CarryBox only: write one exact actor-observation parity snapshot (.npz) and exit."},
         {"name": "--deploy_snapshot_phase", "type": str, "default": None, "choices": ["loco", "pickUp", "carryWith", "putDown"], "help": "CarryBox snapshot only: force random initialization from one skill phase."},
         {"name": "--deploy_snapshot_count", "type": int, "default": 1, "help": "CarryBox snapshot only: export this many sequential deterministic initial-state snapshots."},
+        {"name": "--deploy_trace", "type": str, "default": None, "help": "CarryBox only: write a deterministic per-policy-step diagnostic trace (.jsonl)."},
+        {"name": "--deploy_trace_steps", "type": int, "default": 500, "help": "CarryBox trace only: number of 50 Hz policy steps to record."},
         {"name": "--disable_box_perturb", "action": "store_true", "default": False, "help": "Disable box-COM perturbations during play/evaluation."},
         {"name": "--debug_force_event", "action": "store_true", "default": False, "help": "Force the gated box perturbation event to trigger during play/evaluation."},
         {"name": "--debug_force_sweep", "action": "store_true", "default": False, "help": "Run a deterministic one-robot increasing-force sweep over every box direction."},

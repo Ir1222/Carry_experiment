@@ -782,15 +782,32 @@ class LeggedRobot(BaseTask):
                 "joint_pos": self.dof_pos[env_id].detach().cpu().numpy().copy(),
                 "joint_vel": self.dof_vel[env_id].detach().cpu().numpy().copy(),
                 "end_effector_pos_policy_frame": self.end_effector_pos[env_id].detach().cpu().numpy().copy(),
+                "end_effector_position_world": self.rigid_body_states[env_id, self.hand_pos_indices, 0:3].detach().cpu().numpy().copy(),
+                "end_effector_quat_xyzw": self.rigid_body_states[env_id, self.hand_pos_indices, 3:7].detach().cpu().numpy().copy(),
+                "hand_collision_position_world": self.rigid_body_states[env_id, self.hand_colli_indices, 0:3].detach().cpu().numpy().copy(),
+                "hand_collision_quat_xyzw": self.rigid_body_states[env_id, self.hand_colli_indices, 3:7].detach().cpu().numpy().copy(),
+                "hand_net_contact_force_world": self.contact_forces[env_id, self.hand_colli_indices, :].detach().cpu().numpy().copy(),
                 "previous_action": self.actions[env_id].detach().cpu().numpy().copy(),
                 "box_position_world": self.box_states[env_id, 0:3].detach().cpu().numpy().copy(),
                 "box_quat_xyzw": self.box_states[env_id, 3:7].detach().cpu().numpy().copy(),
+                "box_linear_velocity_world": self.box_states[env_id, 7:10].detach().cpu().numpy().copy(),
+                "box_angular_velocity_world": self.box_states[env_id, 10:13].detach().cpu().numpy().copy(),
                 "box_size": self._box_size[env_id].detach().cpu().numpy().copy(),
+                "box_mass": self.box_masses[env_id].detach().cpu().numpy().copy(),
+                "platform_position_world": self.platform_pos[env_id].detach().cpu().numpy().copy(),
                 "goal_position_world": self.goal_pos[env_id].detach().cpu().numpy().copy(),
                 "success": self.success_buf[env_id].detach().cpu().numpy().copy(),
                 "current_actor_proprio": current_actor_obs[env_id].detach().cpu().numpy().copy(),
                 "task_observation": task_obs_actor[env_id].detach().cpu().numpy().copy(),
             }
+            if hasattr(self, "joint_pos_target"):
+                self._deploy_snapshot["q_target"] = (
+                    self.joint_pos_target[env_id].detach().cpu().numpy().copy()
+                )
+            if hasattr(self, "torques"):
+                self._deploy_snapshot["torque"] = (
+                    self.torques[env_id].detach().cpu().numpy().copy()
+                )
         return current_actor_obs, task_obs_actor, task_obs_critic
 
     def _build_actor_history_obs(self, current_actor_proprio, task_obs_actor, commit: bool):

@@ -227,6 +227,51 @@ Optional `--log path.jsonl` on both executables records observation slices,
 actions, targets, gains, torque, task pose, and contact counts. `--duration`
 provides a bounded headless smoke run.
 
+## Seeded randomized Sim2Sim evaluation
+
+The nominal run above intentionally remains deterministic so it can detect
+interface, timing, mapping, and physics regressions. Policy robustness is
+evaluated separately with serialized seeded scenarios:
+
+```bash
+python -m deploy.tools.evaluate_sim2sim_robustness \
+  --models official_carrybox_65000,model_55500,model_73500 \
+  --randomization-profile light \
+  --seeds 0:10 \
+  --duration 20
+```
+
+`light` interpolates 25 percent from the nominal reset toward the CarryBox
+training envelope. `train_match` applies the full mapped envelope for box
+pose/size/density, robot mass/COM/friction, PD and motor strength, torque bias,
+0--4 policy-step action delay, observation noise, and periodic torso forces.
+It is a stress test: PhysX restitution and MuJoCo contact parameters do not
+have a one-to-one mapping, so reports label this profile
+`train_match_approximation`.
+
+The evaluator writes one immutable `ScenarioSample` JSON per seed and reuses
+that file for every policy. Reports contain per-episode JSON/CSV rows,
+success/termination/timeout outcomes, failure distributions, paired seed
+results, scenario and trajectory hashes, peak torque, tilt, joint-limit and
+contact metrics. Policy failure is an experimental outcome; only
+infrastructure failures make the evaluator fail by default. Use
+`--min-success-rate` to add a CI gate.
+
+For one interactive randomized run:
+
+```bash
+python -m deploy.sim2sim.mujoco_server \
+  --config deploy/config/g1_carrybox.yaml \
+  --transport udp \
+  --randomization-profile light \
+  --seed 7
+```
+
+Backspace advances the episode index and samples a new deterministic sub-seed.
+Pass `--scenario-file path/to/seed_7.json` to replay an exact batch scenario.
+The simulator uses uncorrupted truth for termination and logging while the
+policy transport receives the seeded noisy sensor view.
+
 ## Sim2real dry-run
 
 The actor needs box pose, box size, and goal pose relative to the pelvis policy
@@ -360,6 +405,120 @@ The comparator independently reconstructs the 123-D newest frame from raw
 Isaac world states and checks both it and the 738-D history at `1e-5`. It also
 reports the pelvis/torso quaternion difference so a nonzero-waist snapshot
 detects any future frame regression.
+
+## CarryBox cross-engine grasp diagnosis
+
+Diagnostic exports disable observation noise, box size/density randomization,
+mass/COM/friction/gain/motor randomization, delay, disturbance, push and random
+initial joint offsets. Export an exact state and a 50 Hz trace for each phase
+with a fixed seed:
+
+```bash
+for PHASE in loco pickUp carryWith; do
+  python legged_gym/legged_gym/scripts/play.py \
+    --task carrybox --headless --seed 0 \
+    --resume_path legged_gym/resources/ckpt/carrybox.pt \
+    --deploy_snapshot "$HOME/physhsi_deploy_logs/${PHASE}.npz" \
+    --deploy_snapshot_phase "$PHASE"
+
+  python legged_gym/legged_gym/scripts/play.py \
+    --task carrybox --headless --seed 0 \
+    --resume_path legged_gym/resources/ckpt/carrybox.pt \
+    --deploy_trace "$HOME/physhsi_deploy_logs/${PHASE}.jsonl" \
+    --deploy_trace_steps 500 \
+    --deploy_snapshot_phase "$PHASE"
+done
+```
+
+The snapshot contains root, q/dq, all five endpoints, both rubber-hand poses,
+box pose/velocity/size/mass, platform, goal, previous action, 123-D frame,
+738-D history, actor action, q-target and torque. The trace adds PhysX
+rigid-contact pairs and impulse-derived contact force on every policy step.
+
+Check observation/FK and all three PyTorch/ONNX actors:
+
+```bash
+python -m deploy.tools.compare_carrybox_parity \
+  ~/physhsi_deploy_logs/pickUp.npz
+python -m deploy.tools.compare_actor_snapshot \
+  ~/physhsi_deploy_logs/pickUp.npz
+```
+
+The FK gate is 1 mm per endpoint and the observation/action backend gate is
+`1e-5`. Actor comparison defaults to
+`official_carrybox_65000,model_55500,model_73500`.
+
+Run the collision differential diagnosis on the same snapshot:
+
+```bash
+for COLLISION in current no_robot_self isaac_parity; do
+  python -m deploy.tools.run_udp_smoke \
+    --profile official_carrybox_65000 \
+    --snapshot-file ~/physhsi_deploy_logs/pickUp.npz \
+    --collision-profile "$COLLISION" \
+    --duration 10 \
+    --require-contact-parity \
+    --require-grasp-success \
+    --log-dir ~/physhsi_deploy_logs/"$COLLISION"
+done
+```
+
+`current` reproduces the old 0.01 m all-geom margin. `no_robot_self` removes
+only robot/robot contacts. `isaac_parity` restores self-collision while
+removing the six historically anomalous hand/hip and elbow/wrist pairs and
+sets internal robot margin to zero. These six pairs are candidate exclusions;
+promote this profile to the default only after the new Isaac contact trace
+confirms that PhysX does not contain them.
+
+Compare the hard-coded goal with a seeded sample from the exact Isaac default
+sector by adding `--goal-profile configured` or
+`--goal-profile isaac_sector`. An injected snapshot always wins and retains
+its exact Isaac goal.
+
+Platform and box-size hypotheses also have isolated switches. Use
+`--source-platform-profile enabled|disabled` for the current/old-scene
+comparison. With the same snapshot, test the training minimum, nominal and
+maximum sizes using `--box-size-scale 0.7 0.7 0.6`,
+`--box-size-scale 1 1 1`, and `--box-size-scale 1.3 1.3 1.4`.
+The scale always changes the collision geom and the actor-visible box size
+together while leaving the injected center pose and all robot state fixed.
+
+To separate control/dynamics from contact, replay the Isaac actions without a
+closed-loop policy:
+
+```bash
+python -m deploy.sim2sim.mujoco_server \
+  --config deploy/config/g1_carrybox.yaml \
+  --transport udp --headless \
+  --snapshot-file ~/physhsi_deploy_logs/pickUp.npz \
+  --action-trace ~/physhsi_deploy_logs/pickUp.jsonl \
+  --collision-profile current \
+  --log ~/physhsi_deploy_logs/pickUp_mujoco_open_loop.jsonl
+
+python -m deploy.tools.analyze_carrybox_trace \
+  ~/physhsi_deploy_logs/pickUp.jsonl \
+  --mujoco-trace ~/physhsi_deploy_logs/pickUp_mujoco_open_loop.jsonl
+```
+
+The analyzer reports pre-box-contact q/dq/action/q-target/torque divergence,
+first box contact, all force-bearing pairs, rubber-hand geometry distance and
+the final grasp summary. Grasp success requires both rubber hands above 1 N
+for 0.20 s, box-bottom clearance above 0.05 m, and zero hip/torso/pelvis
+substitute contacts over the episode.
+
+After nominal root-cause isolation, run matched 10-seed regression for each
+collision profile with `light`, then `train_match`:
+
+```bash
+python -m deploy.tools.evaluate_sim2sim_robustness \
+  --models official_carrybox_65000,model_55500,model_73500 \
+  --seeds 0:10 --randomization-profile light \
+  --collision-profile isaac_parity --goal-profile isaac_sector
+```
+
+The report includes grasp rate, first hand/bimanual contact, bimanual dwell,
+minimum palm distance, maximum clearance, anomalous self-contact and
+hip/torso box-contact counts in addition to the existing safety metrics.
 
 Export 20 deterministic reset samples for each task phase with:
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 import socket
@@ -16,6 +17,13 @@ from typing import Any, Sequence
 import numpy as np
 
 from deploy.common.config import load_deploy_config
+from deploy.common.grasp_diagnostics import has_anomalous_self_contact
+from deploy.sim2sim.collision_profiles import COLLISION_PROFILE_NAMES
+from deploy.sim2sim.mujoco_server import (
+    GOAL_PROFILE_NAMES,
+    SOURCE_PLATFORM_PROFILE_NAMES,
+)
+from deploy.sim2sim.randomization import PROFILE_NAMES
 
 
 FORBIDDEN_GROUND_BODY_TOKENS = ("pelvis", "torso", "hip")
@@ -41,7 +49,29 @@ class SmokeSummary:
     non_decimated_policy_step_count: int
     first_failure_sequence: int | None
     first_failure_time: float | None
+    first_failure_code: str | None
     first_failure_reason: str | None
+    randomization_profile: str
+    collision_profile: str
+    seed: int
+    scenario_fingerprint: str | None
+    outcome: str
+    ever_success: bool
+    time_to_success: float | None
+    peak_abs_torque: float
+    max_contact_force: float
+    grasp_success: bool
+    first_left_hand_contact_time: float | None
+    first_right_hand_contact_time: float | None
+    first_bimanual_contact_time: float | None
+    max_bimanual_contact_duration: float
+    max_box_clearance: float | None
+    min_left_palm_box_signed_distance: float | None
+    min_right_palm_box_signed_distance: float | None
+    anomalous_self_contact_steps: int
+    initial_anomalous_self_contact: bool
+    hip_or_torso_box_contact_steps: int
+    trace_hash: str | None
     passed: bool
     failures: tuple[str, ...]
 
@@ -84,6 +114,61 @@ def _all_finite(value: Any) -> bool:
     if isinstance(value, float):
         return math.isfinite(value)
     return True
+
+
+def _trace_hash(records: list[dict[str, Any]]) -> str | None:
+    stable_records: list[dict[str, Any]] = []
+    for record in records:
+        if (
+            not bool(record.get("detail", True))
+            or not bool(record.get("physics_started", False))
+        ):
+            continue
+        stable: dict[str, Any] = {"step_index": len(stable_records)}
+        for key in (
+            "joint_pos",
+            "joint_vel",
+            "box_position_world",
+            "raw_action",
+            "q_target",
+            "torque",
+            "observed_joint_pos",
+            "observed_joint_vel",
+            "disturbance_force_local",
+        ):
+            if key not in record:
+                continue
+            value = record[key]
+            if isinstance(value, list):
+                value = np.round(np.asarray(value, dtype=np.float64), 10).tolist()
+            stable[key] = value
+        stable_records.append(stable)
+    if not stable_records:
+        return None
+    payload = json.dumps(
+        stable_records, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _failure_code(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    lowered = reason.lower()
+    mappings = (
+        ("projected-gravity", "projected_gravity"),
+        ("head-height", "head_height"),
+        ("root-height", "root_height"),
+        ("hip-height", "hip_height"),
+        ("roll termination", "roll"),
+        ("pitch termination", "pitch"),
+        ("forbidden ground contact", "forbidden_ground_contact"),
+        ("joint", "joint_limit"),
+    )
+    for token, code in mappings:
+        if token in lowered:
+            return code
+    return "other"
 
 
 def _rate(
@@ -139,6 +224,8 @@ def analyze_logs(
     simulator_log: Path,
     *,
     warmup_seconds: float = 0.5,
+    require_grasp_success: bool = False,
+    require_contact_parity: bool = False,
 ) -> SmokeSummary:
     policy_all = _read_jsonl(Path(policy_log))
     simulator_all = _read_jsonl(Path(simulator_log))
@@ -153,6 +240,33 @@ def analyze_logs(
     )
     model_profile = str(
         policy_metadata.get("model", {}).get("profile", "<unknown>")
+    )
+    simulator_metadata = next(
+        (
+            item
+            for item in simulator_all
+            if item.get("kind") == "run_metadata"
+            and item.get("component") == "mujoco_server"
+        ),
+        {},
+    )
+    episode_reset = next(
+        (item for item in simulator_all if item.get("kind") == "episode_reset"),
+        {},
+    )
+    scenario = episode_reset.get("scenario", {})
+    randomization_metadata = simulator_metadata.get("randomization", {})
+    collision_profile = str(
+        simulator_metadata.get("collision_profile", "current")
+    )
+    randomization_profile = str(
+        scenario.get(
+            "profile", randomization_metadata.get("profile", "nominal")
+        )
+    )
+    seed = int(scenario.get("seed", randomization_metadata.get("seed", 0)))
+    scenario_fingerprint = scenario.get(
+        "fingerprint", randomization_metadata.get("scenario_fingerprint")
     )
     policy_records = [
         record
@@ -189,7 +303,29 @@ def analyze_logs(
             non_decimated_policy_step_count=0,
             first_failure_sequence=None,
             first_failure_time=None,
+            first_failure_code=None,
             first_failure_reason=None,
+            randomization_profile=randomization_profile,
+            collision_profile=collision_profile,
+            seed=seed,
+            scenario_fingerprint=scenario_fingerprint,
+            outcome="infrastructure_error",
+            ever_success=False,
+            time_to_success=None,
+            peak_abs_torque=0.0,
+            max_contact_force=0.0,
+            grasp_success=False,
+            first_left_hand_contact_time=None,
+            first_right_hand_contact_time=None,
+            first_bimanual_contact_time=None,
+            max_bimanual_contact_duration=0.0,
+            max_box_clearance=None,
+            min_left_palm_box_signed_distance=None,
+            min_right_palm_box_signed_distance=None,
+            anomalous_self_contact_steps=0,
+            initial_anomalous_self_contact=False,
+            hip_or_torso_box_contact_steps=0,
+            trace_hash=None,
             passed=False,
             failures=tuple(failures),
         )
@@ -361,6 +497,65 @@ def analyze_logs(
                 f"{first_failure_reason}"
             )
 
+    successful_records = [
+        item for item in simulator_records if item.get("success") is True
+    ]
+    ever_success = bool(successful_records)
+    time_to_success = (
+        float(successful_records[0].get("sim_time", 0.0))
+        if successful_records
+        else None
+    )
+    peak_abs_torque = max(
+        (
+            float(np.max(np.abs(np.asarray(item["torque"], dtype=np.float64))))
+            for item in simulator_records
+            if "torque" in item
+        ),
+        default=0.0,
+    )
+    max_contact_force = max(
+        (
+            float(item.get("max_contact_force", 0.0))
+            for item in simulator_records
+        ),
+        default=0.0,
+    )
+    grasp_summaries = [
+        item["grasp_summary"]
+        for item in simulator_records
+        if isinstance(item.get("grasp_summary"), dict)
+    ]
+    grasp_summary = grasp_summaries[-1] if grasp_summaries else {}
+    grasp_success = bool(grasp_summary.get("grasp_success", False))
+    initial_anomalous_self_contact = has_anomalous_self_contact(
+        simulator_records[0].get("contacts", ()), force_threshold=1.0
+    )
+    if require_contact_parity and initial_anomalous_self_contact:
+        failures.append(
+            "initial MuJoCo state contains a >1 N anomalous hand/hip or "
+            "elbow/wrist self-contact"
+        )
+    if require_grasp_success and not grasp_success:
+        failures.append(
+            "grasp acceptance gate failed: both hands must exceed 1 N for "
+            "0.20 s, lift clearance must exceed 0.05 m, and hip/torso must "
+            "never substitute for a hand"
+        )
+    success_precedes_failure = ever_success and (
+        first_failure_time is None
+        or (
+            time_to_success is not None
+            and time_to_success <= first_failure_time
+        )
+    )
+    outcome = (
+        "success"
+        if success_precedes_failure
+        else ("termination" if first_failure_reason is not None else "timeout")
+    )
+    trace_hash = _trace_hash(simulator_records)
+
     sequence_resets = sum(
         bool(record.get("state_sequence_reset"))
         for record in policy_records
@@ -437,7 +632,45 @@ def analyze_logs(
         non_decimated_policy_step_count=non_decimated_steps,
         first_failure_sequence=first_failure_sequence,
         first_failure_time=first_failure_time,
+        first_failure_code=_failure_code(first_failure_reason),
         first_failure_reason=first_failure_reason,
+        randomization_profile=randomization_profile,
+        collision_profile=collision_profile,
+        seed=seed,
+        scenario_fingerprint=scenario_fingerprint,
+        outcome=outcome,
+        ever_success=ever_success,
+        time_to_success=time_to_success,
+        peak_abs_torque=peak_abs_torque,
+        max_contact_force=max_contact_force,
+        grasp_success=grasp_success,
+        first_left_hand_contact_time=grasp_summary.get(
+            "first_left_hand_contact_time"
+        ),
+        first_right_hand_contact_time=grasp_summary.get(
+            "first_right_hand_contact_time"
+        ),
+        first_bimanual_contact_time=grasp_summary.get(
+            "first_bimanual_contact_time"
+        ),
+        max_bimanual_contact_duration=float(
+            grasp_summary.get("max_bimanual_contact_duration", 0.0)
+        ),
+        max_box_clearance=grasp_summary.get("max_box_clearance"),
+        min_left_palm_box_signed_distance=grasp_summary.get(
+            "min_left_palm_box_signed_distance"
+        ),
+        min_right_palm_box_signed_distance=grasp_summary.get(
+            "min_right_palm_box_signed_distance"
+        ),
+        anomalous_self_contact_steps=int(
+            grasp_summary.get("anomalous_self_contact_steps", 0)
+        ),
+        initial_anomalous_self_contact=initial_anomalous_self_contact,
+        hip_or_torso_box_contact_steps=int(
+            grasp_summary.get("hip_or_torso_box_contact_steps", 0)
+        ),
+        trace_hash=trace_hash,
         passed=not failures,
         failures=tuple(failures),
     )
@@ -448,9 +681,15 @@ def verify_logs(
     simulator_log: Path,
     *,
     warmup_seconds: float = 0.5,
+    require_grasp_success: bool = False,
+    require_contact_parity: bool = False,
 ) -> SmokeSummary:
     summary = analyze_logs(
-        policy_log, simulator_log, warmup_seconds=warmup_seconds
+        policy_log,
+        simulator_log,
+        warmup_seconds=warmup_seconds,
+        require_grasp_success=require_grasp_success,
+        require_contact_parity=require_contact_parity,
     )
     if not summary.passed:
         raise RuntimeError("; ".join(summary.failures))
@@ -466,6 +705,16 @@ def run_smoke(
     profile: str | None = None,
     warmup_seconds: float = 0.5,
     raise_on_failure: bool = True,
+    randomization_profile: str = "nominal",
+    seed: int = 0,
+    scenario_file: str | Path | None = None,
+    snapshot_file: str | Path | None = None,
+    collision_profile: str = "current",
+    require_grasp_success: bool = False,
+    require_contact_parity: bool = False,
+    goal_profile: str = "configured",
+    source_platform_profile: str = "configured",
+    box_size_scale: tuple[float, float, float] | None = None,
 ) -> SmokeSummary:
     if duration <= 0.0:
         raise ValueError("duration must be positive")
@@ -477,13 +726,16 @@ def run_smoke(
     output_dir = Path(log_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
+    run_tag = (
+        f"{randomization_profile}_{collision_profile}_seed{int(seed)}"
+    )
     simulator_log = (
         output_dir
-        / f"{selected_profile}_mujoco_udp_{stamp}.jsonl"
+        / f"{selected_profile}_{run_tag}_mujoco_udp_{stamp}.jsonl"
     )
     policy_log = (
         output_dir
-        / f"{selected_profile}_policy_udp_{stamp}.jsonl"
+        / f"{selected_profile}_{run_tag}_policy_udp_{stamp}.jsonl"
     )
 
     server_command = [
@@ -497,7 +749,27 @@ def run_smoke(
         "--headless",
         "--log",
         str(simulator_log),
+        "--randomization-profile",
+        randomization_profile,
+        "--seed",
+        str(int(seed)),
+        "--collision-profile",
+        collision_profile,
+        "--goal-profile",
+        goal_profile,
+        "--source-platform-profile",
+        source_platform_profile,
     ]
+    if scenario_file is not None:
+        scenario_path = Path(scenario_file).expanduser().resolve()
+        server_command.extend(("--scenario-file", str(scenario_path)))
+    if snapshot_file is not None:
+        snapshot_path = Path(snapshot_file).expanduser().resolve()
+        server_command.extend(("--snapshot-file", str(snapshot_path)))
+    if box_size_scale is not None:
+        server_command.extend(
+            ("--box-size-scale", *(str(float(value)) for value in box_size_scale))
+        )
     policy_command = [
         sys.executable,
         "-m",
@@ -561,6 +833,8 @@ def run_smoke(
         policy_log,
         simulator_log,
         warmup_seconds=warmup_seconds,
+        require_grasp_success=require_grasp_success,
+        require_contact_parity=require_contact_parity,
     )
     if raise_on_failure and not summary.passed:
         raise RuntimeError("; ".join(summary.failures))
@@ -574,6 +848,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration", type=float, default=10.0)
     parser.add_argument("--startup-timeout", type=float, default=20.0)
     parser.add_argument("--warmup-seconds", type=float, default=0.5)
+    parser.add_argument(
+        "--randomization-profile",
+        choices=PROFILE_NAMES,
+        default="nominal",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--scenario-file")
+    parser.add_argument("--snapshot-file")
+    parser.add_argument(
+        "--collision-profile",
+        choices=COLLISION_PROFILE_NAMES,
+        default="current",
+    )
+    parser.add_argument("--require-grasp-success", action="store_true")
+    parser.add_argument("--require-contact-parity", action="store_true")
+    parser.add_argument(
+        "--goal-profile",
+        choices=GOAL_PROFILE_NAMES,
+        default="configured",
+    )
+    parser.add_argument(
+        "--source-platform-profile",
+        choices=SOURCE_PLATFORM_PROFILE_NAMES,
+        default="configured",
+    )
+    parser.add_argument(
+        "--box-size-scale",
+        type=float,
+        nargs=3,
+        metavar=("SX", "SY", "SZ"),
+    )
     parser.add_argument(
         "--log-dir",
         default=str(Path.home() / "physhsi_deploy_logs"),
@@ -590,6 +895,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.log_dir,
         profile=args.profile,
         warmup_seconds=args.warmup_seconds,
+        randomization_profile=args.randomization_profile,
+        seed=args.seed,
+        scenario_file=args.scenario_file,
+        snapshot_file=args.snapshot_file,
+        collision_profile=args.collision_profile,
+        require_grasp_success=args.require_grasp_success,
+        require_contact_parity=args.require_contact_parity,
+        goal_profile=args.goal_profile,
+        source_platform_profile=args.source_platform_profile,
+        box_size_scale=(
+            None
+            if args.box_size_scale is None
+            else tuple(args.box_size_scale)
+        ),
     )
     print("Strict UDP Sim2Sim validation passed.")
     print(json.dumps(summary.to_dict(), indent=2))
